@@ -3,8 +3,8 @@ use amaterasu_module_sdk::extension_api::{
     ApplyPolicy, ExtensionDescriptor, MethodRef, OptionDescriptor, SettingScope,
 };
 
-pub const PROVIDER: &str = "amaterasu.display-settings";
-pub const SERVICE: &str = "amaterasu.display-settings/1";
+pub const PROVIDER: &str = "nonary.display-settings";
+pub const SERVICE: &str = "nonary.display-settings/1";
 
 /// Settings-only descriptor. Actions become discoverable when their admitted
 /// lifecycle-backed execution is implemented and approved.

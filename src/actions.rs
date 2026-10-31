@@ -5,9 +5,9 @@ use serde_json::Value;
 
 use crate::policy::{DisplayMode, RefreshRate, Resolution};
 
-pub const REMOVE_OWNED: &str = "amaterasu.display-settings/remove-owned";
-pub const RECREATE_OWNED: &str = "amaterasu.display-settings/recreate-owned";
-pub const SET_MODE: &str = "amaterasu.display-settings/set-mode";
+pub const REMOVE_OWNED: &str = "nonary.display-settings/remove-owned";
+pub const RECREATE_OWNED: &str = "nonary.display-settings/recreate-owned";
+pub const SET_MODE: &str = "nonary.display-settings/set-mode";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayAction {

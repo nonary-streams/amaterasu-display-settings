@@ -1,5 +1,5 @@
 {
-  "id": "amaterasu.display-settings",
+  "id": "nonary.display-settings",
   "version": "0.1.0",
   "file": "libamaterasu_display_settings.so",
   "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
@@ -7,5 +7,5 @@
   "abi_major": 1,
   "runtime": false,
   "requires": {"amaterasu.runtime": "0.1.0"},
-  "requested": {"provide": ["amaterasu.display-settings/1"]}
+  "requested": {"provide": ["nonary.display-settings/1"]}
 }

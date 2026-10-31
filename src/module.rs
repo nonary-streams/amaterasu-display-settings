@@ -6,7 +6,7 @@ use amaterasu_module_sdk::{
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-const SERVICE: &str = "amaterasu.display-settings/1";
+const SERVICE: &str = "nonary.display-settings/1";
 const REGISTRY_CALLER: &str = "amaterasu.extension-registry";
 
 /// Only the settings validation endpoint is registered until lifecycle effect

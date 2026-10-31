@@ -1,5 +1,5 @@
 {
-  "provider": "amaterasu.display-settings",
+  "provider": "nonary.display-settings",
   "revision": 1,
   "options": [
     {
@@ -344,7 +344,7 @@
   "actions": [],
   "capabilities": [],
   "settings_validate": {
-    "service": "amaterasu.display-settings/1",
+    "service": "nonary.display-settings/1",
     "method": "settings_validate",
     "interface_major": 1,
     "interface_minor": 0,

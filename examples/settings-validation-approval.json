@@ -1,8 +1,8 @@
 {
-  "provider": "amaterasu.display-settings",
+  "provider": "nonary.display-settings",
   "callers": ["amaterasu.extension-registry", "amaterasu.management"],
   "method": {
-    "service": "amaterasu.display-settings/1",
+    "service": "nonary.display-settings/1",
     "method": "settings_validate",
     "interface_major": 1,
     "interface_minor": 0,
