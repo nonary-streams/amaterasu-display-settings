@@ -23,3 +23,8 @@ No private Amaterasu Rust crates are imported directly.
 
 No local build or unit test modifies displays. Tests do not establish that native
 mode setting, recovery, capture binding, or either platform works on hardware.
+
+The receipt-store client retains at most 64 operation records and fails closed
+at capacity. Safe retirement needs a coordinator-authorized epoch and replay
+watermark; the store must not be used for production lifecycle effects until
+that contract and recovery integration are available.
