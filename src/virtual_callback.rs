@@ -13,11 +13,23 @@ use amaterasu_module_sdk::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 const COORDINATOR: &str = "amaterasu.session-lifecycle";
 const CAPTURE: &str = "amaterasu.capture-pipewire/1";
 const SELECTOR: &str = "amaterasu.kwin-wl-output/1";
 const MAX_STATUS: u8 = 16;
+
+/// Stable producer identity shared by references to one observed compositor output.
+pub(crate) fn producer_incarnation(
+    domain_id: &str,
+    identity: &str,
+    output: &wire::ObservedOutput,
+) -> String {
+    let bytes =
+        serde_json::to_vec(&(domain_id, identity, output)).expect("typed output serializes");
+    format!("{:x}", Sha256::digest(bytes))
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -236,7 +248,10 @@ impl VirtualCallback {
                 && r.access == ResourceAccess::Exclusive
         }) || !plan.mutation_domains.iter().any(|d| {
             d.domain == requested.domain_id
-                && d.expected_revision == requested.domain_revision
+                && (!matches!(
+                    request.phase,
+                    LifecyclePhase::SessionPrepare | LifecyclePhase::StreamPrepare
+                ) || d.expected_revision == requested.domain_revision)
                 && d.access == ResourceAccess::Exclusive
         }) {
             return Err("virtual_target_not_admitted");
@@ -656,7 +671,11 @@ impl VirtualCallback {
         let resource = ResourceRef {
             provider: crate::descriptor::PROVIDER.into(),
             resource_id: self.obligation.identity.clone(),
-            incarnation: borrow.borrow_id.clone(),
+            incarnation: producer_incarnation(
+                &self.obligation.domain_id,
+                &self.obligation.identity,
+                &borrow.observed_output,
+            ),
             revision: borrow.mutation_domain.revision,
             execution_domain: constraint.execution_domain.clone(),
             mutation_domain: Some(borrow.mutation_domain.id.clone()),
@@ -805,7 +824,11 @@ mod tests {
         let CallbackProgress::Complete(CallbackResult::Prepared { candidate, .. }) = result else {
             panic!("{result:?}")
         };
-        assert_eq!(candidate.resource.incarnation, "a".repeat(64));
+        let observed = serde_json::from_value(borrow()["observed_output"].clone()).unwrap();
+        assert_eq!(
+            candidate.resource.incarnation,
+            producer_incarnation(DOMAIN, ID, &observed)
+        );
         assert_eq!(candidate.resource.provider, crate::descriptor::PROVIDER);
         assert_eq!(candidate.resource.revision, 3);
         assert_eq!(candidate.selector["output"], "kwin:Virtual-1");
@@ -970,6 +993,23 @@ mod tests {
     }
 
     #[test]
+    fn producer_incarnation_is_shared_between_borrows_and_changes_with_output() {
+        let payload = borrow();
+        let first: DisplayBorrow = serde_json::from_value(json!({"borrow_id":payload["borrow_id"],"observed_output":payload["observed_output"],"mutation_domain":payload["mutation_domain"]})).unwrap();
+        let mut second = first.clone();
+        second.borrow_id = "c".repeat(64);
+        second.mutation_domain.revision += 1;
+        assert_eq!(
+            producer_incarnation(DOMAIN, ID, &first.observed_output),
+            producer_incarnation(DOMAIN, ID, &second.observed_output)
+        );
+        second.observed_output.registry_global += 1;
+        assert_ne!(
+            producer_incarnation(DOMAIN, ID, &first.observed_output),
+            producer_incarnation(DOMAIN, ID, &second.observed_output)
+        );
+    }
+    #[test]
     fn release_verifies_ownership_then_releases_borrow_before_monitor() {
         let mut req = request();
         let mut prior = VirtualCallback::new(COORDINATOR, req.clone(), None, |_| true, 0, Some(99))
@@ -982,6 +1022,8 @@ mod tests {
             mutation_domain: serde_json::from_value(p["mutation_domain"].clone()).unwrap(),
         });
         req.phase = LifecyclePhase::StreamRelease;
+        // Acquiring the retained borrow advanced the domain after prepare.
+        req.approved_plan.as_mut().unwrap().mutation_domains[0].expected_revision = 2;
         let mut machine =
             VirtualCallback::new(COORDINATOR, req, Some(prior), |_| true, 0, Some(99)).unwrap();
         let mut store = FakeStore {
@@ -1097,7 +1139,12 @@ impl BindingValidator {
             || request.borrow_id != borrow.borrow_id
             || request.binding.resource.provider != crate::descriptor::PROVIDER
             || request.binding.resource.resource_id != obligation.identity
-            || request.binding.resource.incarnation != borrow.borrow_id
+            || request.binding.resource.incarnation
+                != producer_incarnation(
+                    &obligation.domain_id,
+                    &obligation.identity,
+                    &borrow.observed_output,
+                )
             || request.binding.capture_provider != CAPTURE
             || request.binding.selector_schema != SELECTOR
             || request.binding.selector

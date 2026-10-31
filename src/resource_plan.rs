@@ -38,6 +38,7 @@ pub struct Planner {
     parent: Option<u64>,
     physical_domain: Option<(String, u64)>,
     session: Option<VerifiedSessionDisplay>,
+    release: Option<(VirtualObligation, MutationDomainPlan, ResourceObligation)>,
 }
 
 /// Exact session-scoped obligation loaded from the authenticated provider
@@ -67,6 +68,11 @@ impl VerifiedSessionDisplay {
         })
     }
 }
+/// Coordinator-admitted cleanup authority for a retained target journal entry.
+pub struct ReleaseAuthority {
+    pub domain: MutationDomainPlan,
+    pub cleanup: ResourceObligation,
+}
 enum Selection {
     Virtual {
         identity: String,
@@ -80,6 +86,7 @@ enum Selection {
 enum Stage {
     VirtualStatus,
     ValidateSessionBorrow,
+    ValidateReleaseBorrow,
     PhysicalStatus,
     PhysicalSnapshot,
 }
@@ -209,6 +216,82 @@ impl Planner {
             parent,
             physical_domain: None,
             session: None,
+            release: None,
+        })
+    }
+    /// Plan release from the authenticated durable target and domain snapshot.
+    pub fn new_release(
+        caller: &str,
+        request: ProviderRequest,
+        prior: VirtualObligation,
+        authority: ReleaseAuthority,
+        parent: Option<u64>,
+        now_ms: u64,
+        verify: impl FnOnce(&ProviderRequest) -> bool,
+    ) -> Result<Self, &'static str> {
+        use extension_api::LifecyclePhase;
+        let ReleaseAuthority { domain, cleanup } = authority;
+        if !matches!(
+            request.phase,
+            LifecyclePhase::SessionRelease | LifecyclePhase::StreamRelease
+        ) || caller != COORDINATOR
+            || request.operation != ProviderOperation::ResourcePlan
+            || extension_api::validate_provider_request(&request).is_err()
+            || !verify(&request)
+            || prior.reference_released
+            || prior.provider_service != virtual_display::SERVICE
+            || prior.borrow.is_none()
+            || domain.domain != prior.domain_id
+            || domain.access != ResourceAccess::Exclusive
+        {
+            return Err("release_ownership_unverified");
+        }
+        let (session, reference) = target_ids(&request.target)?;
+        if prior.identity != stable_uuid("display", session)
+            || prior.reference_id != format!("ref-{}", stable_hex("reference", &reference))
+        {
+            return Err("release_ownership_mismatch");
+        }
+        virtual_display::DisplayReference {
+            identity: prior.identity.clone(),
+            reference_id: prior.reference_id.clone(),
+        }
+        .validate()?;
+        let borrow = prior.borrow.as_ref().ok_or("missing_release_borrow")?;
+        let payload = json!({"action":"validate_borrow","identity":prior.identity,
+            "reference_id":prior.reference_id,"borrow_id":borrow.borrow_id});
+        let timeout = request.remaining_ms.min(30_000);
+        let exchange = make_exchange(
+            virtual_display::SERVICE,
+            payload,
+            &request,
+            "validate-release",
+            parent,
+            timeout,
+        )?;
+        let selection = Selection::Virtual {
+            identity: prior.identity.clone(),
+            reference_id: prior.reference_id.clone(),
+            mode: VideoMode {
+                width: prior.width,
+                height: prior.height,
+                refresh_millihz: prior.refresh_millihz,
+                hdr: prior.hdr_enabled,
+            },
+            layout: Some(prior.layout.clone()),
+        };
+        Ok(Self {
+            request,
+            selection,
+            stage: Stage::ValidateReleaseBorrow,
+            exchange,
+            deadline_ms: now_ms.saturating_add(timeout),
+            failures: 0,
+            finished: None,
+            parent,
+            physical_domain: None,
+            session: None,
+            release: Some((prior, domain, cleanup)),
         })
     }
     /// Attach only a coordinator-bound journal record before the first poll.
@@ -327,6 +410,15 @@ impl Planner {
     }
     fn consume(&mut self, payload: Value, now_ms: u64) -> PlanProgress {
         match self.stage {
+            Stage::ValidateReleaseBorrow => {
+                let result = self.release_plan(&payload);
+                match result {
+                    Ok(plan) => self.finish(PlanProgress::Complete(Box::new(
+                        ProviderResponse::Planned { plan },
+                    ))),
+                    Err(reason) => self.finish(rejected(reason)),
+                }
+            }
             Stage::ValidateSessionBorrow => {
                 let Some(session) = self.session.as_mut() else {
                     return self.finish(rejected("session_ownership_unverified"));
@@ -600,6 +692,85 @@ impl Planner {
             affected_consumers: vec![],
             consumer_change: ConsumerChange::ReconnectRequired,
             candidate_constraint: None,
+            allowed_degradation: vec![],
+        };
+        extension_api::validate_resource_plan(&plan).map_err(|_| "invalid_resource_plan")?;
+        Ok(plan)
+    }
+    fn release_plan(&self, payload: &Value) -> Result<ResourcePlan, &'static str> {
+        let (prior, domain, cleanup) = self
+            .release
+            .as_ref()
+            .ok_or("release_ownership_unverified")?;
+        let saved = prior.borrow.as_ref().ok_or("missing_release_borrow")?;
+        let observed: virtual_display::ObservedOutput = serde_json::from_value(
+            payload
+                .get("observed_output")
+                .cloned()
+                .ok_or("release_borrow_unverified")?,
+        )
+        .map_err(|_| "release_borrow_unverified")?;
+        let current: virtual_display::MutationDomain = serde_json::from_value(
+            payload
+                .get("mutation_domain")
+                .cloned()
+                .ok_or("release_borrow_unverified")?,
+        )
+        .map_err(|_| "release_borrow_unverified")?;
+        if payload.get("ok").and_then(Value::as_bool) != Some(true)
+            || payload.get("borrow_id").and_then(Value::as_str) != Some(saved.borrow_id.as_str())
+            || observed != saved.observed_output
+            || observed.width != prior.width
+            || observed.height != prior.height
+            || observed.refresh_millihz != prior.refresh_millihz
+            || current.id != prior.domain_id
+            || current.scope != "provider_session"
+            || current.revision != domain.expected_revision
+            || current.borrowers != domain.borrowers.len() as u64
+            || current.pending_mutations != 0
+        {
+            return Err("release_borrow_unverified");
+        }
+        let revision = self.request.provider_sequence;
+        let mut retained = prior.clone();
+        retained.borrow = None;
+        let resource = PlannedResource {
+            provider: descriptor::PROVIDER.into(),
+            resource_id: prior.identity.clone(),
+            incarnation: None,
+            expected_revision: None,
+            execution_domain: self.request.consumer_requirements.execution_domain.clone(),
+            mutation_domains: vec![prior.domain_id.clone()],
+            access: ResourceAccess::Exclusive,
+        };
+        let plan = ResourcePlan {
+            plan_id: format!(
+                "display-plan-{}",
+                stable_hex("plan", &self.request.transition_id)
+            ),
+            revision,
+            resources: vec![resource],
+            mutation_domains: vec![domain.clone()],
+            required_capabilities: vec![],
+            constraints: json!({"virtual_display":retained}),
+            obligations: vec![cleanup.clone()],
+            affected_consumers: vec![],
+            consumer_change: ConsumerChange::ReconnectRequired,
+            candidate_constraint: Some(BindingConstraint {
+                capture_provider: CAPTURE.into(),
+                selector_schema: SELECTOR.into(),
+                resource_provider: descriptor::PROVIDER.into(),
+                resource_id: prior.identity.clone(),
+                incarnation: None,
+                execution_domain: self.request.consumer_requirements.execution_domain.clone(),
+                mode: Some(VideoMode {
+                    width: prior.width,
+                    height: prior.height,
+                    refresh_millihz: prior.refresh_millihz,
+                    hdr: prior.hdr_enabled,
+                }),
+                plan_revision: revision,
+            }),
             allowed_degradation: vec![],
         };
         extension_api::validate_resource_plan(&plan).map_err(|_| "invalid_resource_plan")?;
@@ -1018,6 +1189,96 @@ mod tests {
         assert!(
             matches!(&commands[..],[Command::Request {service,payload,..},Command::TakeResult {..},Command::ReleaseResult {..}] if service==virtual_display::SERVICE && payload["action"]=="status")
         );
+    }
+    #[test]
+    fn releases_reuse_owned_geometry_and_validate_live_borrow() {
+        for session_scope in [false, true] {
+            let mut req = request();
+            req.requested_video = None;
+            if session_scope {
+                req.target = serde_json::from_value(json!({"kind":"session","host_epoch":"epoch-1","session_id":"session-1","generation":1})).unwrap();
+                req.phase = extension_api::LifecyclePhase::SessionRelease;
+            } else {
+                req.phase = extension_api::LifecyclePhase::StreamRelease;
+            }
+            let (session, reference) = target_ids(&req.target).unwrap();
+            let identity = stable_uuid("display", session);
+            let reference = format!("ref-{}", stable_hex("reference", &reference));
+            let observation = json!({"version":1,"protocol":"wayland-wl-output","compositor_id":"b".repeat(64),"registry_global":4,"output_name":"Virtual-1","width":1920,"height":1080,"refresh_millihz":60000});
+            let domain = json!({"id":"provider_session:abc","revision":7,"borrowers":1,"pending_mutations":0,"scope":"provider_session"});
+            let borrow = json!({"borrow_id":"a".repeat(64),"observed_output":observation,"mutation_domain":domain});
+            let prior: VirtualObligation = serde_json::from_value(json!({"provider_service":virtual_display::SERVICE,"identity":identity,"reference_id":reference,"width":1920,"height":1080,"refresh_millihz":60000,"name":"Amaterasu","hdr_enabled":false,"scale":0,"layout":"extended","domain_id":"provider_session:abc","domain_revision":6,"geometry_revision":1,"borrow":borrow,"reference_released":false})).unwrap();
+            let domain = MutationDomainPlan {
+                domain: "provider_session:abc".into(),
+                expected_revision: 7,
+                borrowers: BTreeMap::from([("owner".into(), 1)]),
+                access: ResourceAccess::Exclusive,
+            };
+            let cleanup = ResourceObligation {
+                obligation_id: "cleanup-1".into(),
+                provider: descriptor::PROVIDER.into(),
+                resource_id: prior.identity.clone(),
+                mutation_domain: Some(prior.domain_id.clone()),
+                depends_on: vec![],
+                cleanup_method: MethodRef {
+                    service: descriptor::SERVICE.into(),
+                    method: "lifecycle_callback".into(),
+                    interface_major: 1,
+                    interface_minor: 0,
+                    schema_revision: 1,
+                },
+                payload: json!({"service":virtual_display::SERVICE,"identity":prior.identity,"reference_id":prior.reference_id}),
+            };
+            let mut planner = Planner::new_release(
+                COORDINATOR,
+                req.clone(),
+                prior.clone(),
+                ReleaseAuthority { domain, cleanup },
+                Some(2),
+                0,
+                |_| true,
+            )
+            .unwrap();
+            let mut live = borrow.clone();
+            live["ok"] = json!(true);
+            let plan = planner.release_plan(&live).unwrap();
+            assert_eq!(plan.constraints["virtual_display"]["domain_revision"], 6);
+            assert_eq!(plan.constraints["virtual_display"]["geometry_revision"], 1);
+            assert_eq!(plan.mutation_domains[0].expected_revision, 7);
+            assert_eq!(
+                extension_api::validate_provider_response(
+                    &req,
+                    &ProviderResponse::Planned { plan }
+                ),
+                Ok(())
+            );
+            let mut replies = VecDeque::from([
+                Ok(Response::Accepted { id: 5 }),
+                Ok(Response::Result {
+                    payload: live.clone(),
+                }),
+                Ok(Response::Ok),
+            ]);
+            let mut commands = Vec::new();
+            let mut progress = PlanProgress::Waiting;
+            for tick in 0..3 {
+                progress = planner.poll(tick, &mut |command| {
+                    commands.push(command);
+                    replies.pop_front().unwrap()
+                });
+            }
+            assert!(
+                matches!(progress, PlanProgress::Complete(response) if matches!(*response, ProviderResponse::Planned { .. }))
+            );
+            assert!(
+                matches!(&commands[0], Command::Request { payload, .. } if payload["action"] == "validate_borrow")
+            );
+            live["observed_output"]["registry_global"] = json!(8);
+            assert_eq!(
+                planner.release_plan(&live).unwrap_err(),
+                "release_borrow_unverified"
+            );
+        }
     }
     #[test]
     fn stream_reuses_only_verified_session_reference_and_matching_live_output() {

@@ -253,6 +253,7 @@ struct Exchange {
 /// reconciliation; absence alone cannot disprove an in-flight write.
 pub struct PendingStoreOperation {
     operation: Operation,
+    collection: String,
     prefix: String,
     parent: Option<u64>,
     timeout_ms: u64,
@@ -273,12 +274,57 @@ impl PendingStoreOperation {
         timeout_ms: u64,
         now_ms: u64,
     ) -> Result<Self, &'static str> {
+        Self::in_collection(
+            operation,
+            COLLECTION.to_owned(),
+            prefix,
+            parent,
+            timeout_ms,
+            now_ms,
+        )
+    }
+    /// A distinct collection for a broker-authenticated action dispatcher epoch.
+    pub(crate) fn new_action_epoch(
+        operation: Operation,
+        epoch: &str,
+        prefix: String,
+        parent: Option<u64>,
+        timeout_ms: u64,
+        now_ms: u64,
+    ) -> Result<Self, &'static str> {
+        if epoch.len() != 32
+            || !epoch
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || operation.epoch() != epoch
+            || matches!(operation, Operation::Rollover { .. })
+        {
+            return Err("invalid_action_epoch");
+        }
+        Self::in_collection(
+            operation,
+            format!("display-settings/action-receipts-v1/{epoch}"),
+            prefix,
+            parent,
+            timeout_ms,
+            now_ms,
+        )
+    }
+    fn in_collection(
+        operation: Operation,
+        collection: String,
+        prefix: String,
+        parent: Option<u64>,
+        timeout_ms: u64,
+        now_ms: u64,
+    ) -> Result<Self, &'static str> {
         operation.validate()?;
         if !valid_id(&prefix, 100) || !(1..=30_000).contains(&timeout_ms) {
             return Err("invalid_broker_operation");
         }
         let mut call = Self {
             operation,
+            collection,
             prefix,
             parent,
             timeout_ms,
@@ -311,7 +357,7 @@ impl PendingStoreOperation {
     }
     fn start_read(&mut self) {
         self.set_exchange(
-            json!({"action":"collection_get","collection":COLLECTION,"key":self.operation.key()}),
+            json!({"action":"collection_get","collection":self.collection,"key":self.operation.key()}),
             "read",
         );
         self.phase = Phase::Read;
@@ -494,7 +540,7 @@ impl PendingStoreOperation {
                         return self.done(Outcome::Unknown);
                     };
                     self.retirement = Some((meta, revision));
-                    self.set_exchange(json!({"action":"collection_get","collection":COLLECTION,"key":format!("{oldest:020}")}), "oldest");
+                    self.set_exchange(json!({"action":"collection_get","collection":self.collection,"key":format!("{oldest:020}")}), "oldest");
                     self.phase = Phase::ReadOldest;
                     return Progress::Waiting;
                 }
@@ -572,7 +618,7 @@ impl PendingStoreOperation {
         };
         self.write_revision = Some(next);
         self.write_outcome = Some(outcome);
-        self.set_exchange(json!({"action":"collection_commit","collection":COLLECTION,"expected_revision":revision,"metadata":meta,"edits":edits}), "write");
+        self.set_exchange(json!({"action":"collection_commit","collection":self.collection,"expected_revision":revision,"metadata":meta,"edits":edits}), "write");
         self.phase = Phase::Write;
         Progress::Waiting
     }
@@ -640,7 +686,7 @@ impl PendingStoreOperation {
         let receipt = self.operation.receipt(ReceiptState::Pending);
         self.write_revision = Some(next_revision);
         self.write_outcome = Some(Outcome::Begun);
-        self.set_exchange(json!({"action":"collection_commit","collection":COLLECTION,"expected_revision":revision,"metadata":metadata,"edits":[{"key":format!("{low:020}"),"value":null},{"key":self.operation.key(),"value":receipt}]}), "write");
+        self.set_exchange(json!({"action":"collection_commit","collection":self.collection,"expected_revision":revision,"metadata":metadata,"edits":[{"key":format!("{low:020}"),"value":null},{"key":self.operation.key(),"value":receipt}]}), "write");
         self.phase = Phase::Write;
         Progress::Waiting
     }

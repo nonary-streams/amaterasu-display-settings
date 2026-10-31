@@ -1342,7 +1342,12 @@ impl VirtualDurableStateStore {
                         if saved.reference_released
                             || candidate.resource.provider != crate::descriptor::PROVIDER
                             || candidate.resource.resource_id != saved.identity
-                            || candidate.resource.incarnation.as_str() != borrow.borrow_id.as_str()
+                            || candidate.resource.incarnation
+                                != virtual_callback::producer_incarnation(
+                                    &saved.domain_id,
+                                    &saved.identity,
+                                    &borrow.observed_output,
+                                )
                             || candidate.resource.revision != borrow.mutation_domain.revision
                             || candidate.resource.mutation_domain.as_deref()
                                 != Some(saved.domain_id.as_str())
@@ -1840,7 +1845,7 @@ mod virtual_tests {
             ),
             StoreProgress::Saved
         );
-        let candidate = serde_json::from_value(json!({"capture_provider":"capture","selector_schema":"selector","selector":{},"resource":{"provider":"nonary.display-settings","resource_id":o.identity,"incarnation":"borrow-1","revision":3,"execution_domain":"desktop","mutation_domain":"desktop"},"mode":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false},"plan_revision":1,"geometry_revision":1,"generation":1,"fallback":"forbidden"})).unwrap();
+        let candidate = serde_json::from_value(json!({"capture_provider":"capture","selector_schema":"selector","selector":{},"resource":{"provider":"nonary.display-settings","resource_id":o.identity,"incarnation":virtual_callback::producer_incarnation(&o.domain_id, &o.identity, &o.borrow.as_ref().unwrap().observed_output),"revision":3,"execution_domain":"desktop","mutation_domain":"desktop"},"mode":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false},"plan_revision":1,"geometry_revision":1,"generation":1,"fallback":"forbidden"})).unwrap();
         assert_eq!(
             drive(
                 &mut state,

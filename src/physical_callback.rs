@@ -158,7 +158,10 @@ impl PhysicalCallback {
         }
         if !plan.mutation_domains.iter().any(|domain| {
             domain.domain == physical.expected_mutation_domain_id
-                && domain.expected_revision == physical.expected_mutation_domain_revision
+                && (!matches!(
+                    request.phase,
+                    LifecyclePhase::SessionPrepare | LifecyclePhase::StreamPrepare
+                ) || domain.expected_revision == physical.expected_mutation_domain_revision)
                 && domain.access == ResourceAccess::Exclusive
         }) {
             return Err("physical_domain_not_admitted");
@@ -658,6 +661,7 @@ mod tests {
         let mut req = request();
         req.phase = LifecyclePhase::StreamRelease;
         req.operation_id = "release-1".into();
+        req.approved_plan.as_mut().unwrap().mutation_domains[0].expected_revision = 3;
         let constraint: PhysicalConstraint = serde_json::from_value(
             req.approved_plan.as_ref().unwrap().constraints["physical"].clone(),
         )

@@ -28,8 +28,48 @@ struct PendingRequest {
     phase: PendingPhase,
 }
 enum PendingPhase {
+    ActionPlan {
+        planner: Box<crate::action_provider::ActionPlanner>,
+        request: Box<crate::action_provider::PlanRequest>,
+    },
+    ActionExecute {
+        machine: Box<crate::action_provider::ActionExecution>,
+        store: Box<crate::action_store::DurableActionStore>,
+        backend: Box<crate::action_backend::VirtualActionBackend>,
+        operation_id: String,
+    },
+    ActionStatus {
+        request: Box<crate::action_provider::StatusRequest>,
+        store: Box<crate::action_store::DurableActionStore>,
+    },
     Plan {
         planner: Box<crate::resource_plan::Planner>,
+    },
+    PhysicalReleaseLoad {
+        request: Box<ProviderRequest>,
+        domains: Vec<extension_api::MutationDomainPlan>,
+        plans: Vec<extension_api::ResourcePlan>,
+        obligations: Vec<extension_api::ResourceObligation>,
+        store: Box<crate::durable_store::StateDurableStore>,
+    },
+    PhysicalReleasePlan {
+        planner: Box<crate::physical_release_plan::PhysicalReleasePlanner>,
+        domain: extension_api::MutationDomainPlan,
+        obligations: Vec<extension_api::ResourceObligation>,
+    },
+    RefreshRelease {
+        request: Box<ProviderRequest>,
+        refresh: Box<crate::observation_refresh::ObservationRefresh>,
+        plans: Vec<extension_api::ResourcePlan>,
+        obligations: Vec<extension_api::ResourceObligation>,
+    },
+    PlanReleaseLoad {
+        request: Box<ProviderRequest>,
+        expected: Box<crate::virtual_callback::VirtualObligation>,
+        domains: Vec<extension_api::MutationDomainPlan>,
+        plans: Vec<extension_api::ResourcePlan>,
+        obligations: Vec<extension_api::ResourceObligation>,
+        store: Box<crate::durable_store::VirtualDurableStateStore>,
     },
     PlanSessionLoad {
         planner: Box<crate::resource_plan::Planner>,
@@ -150,6 +190,42 @@ fn registration(method: &str) -> Command {
             ],
             &[],
         ),
+        "action_plan" => schema(
+            &[
+                ("version", Kind::Integer),
+                ("operation_id", Kind::String),
+                ("action_id", Kind::String),
+                ("target", Kind::Object),
+                ("arguments", Kind::Object),
+                ("expected_settings_revision", Kind::Any),
+            ],
+            &[],
+        ),
+        "action_execute" => schema(
+            &[
+                ("version", Kind::Integer),
+                ("operation_id", Kind::String),
+                ("action_id", Kind::String),
+                ("target", Kind::Object),
+                ("arguments", Kind::Object),
+                ("expected_settings_revision", Kind::Any),
+                ("plan", Kind::Object),
+                ("plan_digest", Kind::String),
+                ("permit", Kind::String),
+            ],
+            &[],
+        ),
+        "action_status" => schema(
+            &[
+                ("version", Kind::Integer),
+                ("operation_id", Kind::String),
+                ("action_id", Kind::String),
+                ("target", Kind::Object),
+                ("plan_digest", Kind::String),
+                ("provider_receipt", Kind::Object),
+            ],
+            &[],
+        ),
         _ => unreachable!("known registered method"),
     };
     let response = if method == "settings_validate" {
@@ -172,6 +248,9 @@ fn registration(method: &str) -> Command {
                 ("plan_revision", Kind::Integer),
                 ("binding", Kind::Object),
                 ("observation", Kind::Object),
+                ("action_id", Kind::String),
+                ("receipt", Kind::Object),
+                ("cleanup_complete", Kind::Boolean),
             ],
         )
     };
@@ -230,11 +309,30 @@ enum Dispatch {
     Verify(Box<ProviderRequest>, Box<PendingVerification>),
     Binding(Box<crate::virtual_callback::BindingValidationRequest>),
     Status(Box<ProviderStatusRequest>),
+    ActionExecute(Box<crate::action_provider::ExecuteRequest>),
+    ActionStatus(Box<crate::action_provider::StatusRequest>),
+    ActionPlan(Box<crate::action_provider::PlanRequest>),
 }
 fn dispatch(caller: &str, payload: &Value, now_ms: u64, remaining_ms: u64) -> Dispatch {
     let Some((method, args)) = arguments(payload) else {
         return Dispatch::Immediate(rejected("invalid_request"));
     };
+    if matches!(method, "action_plan" | "action_execute" | "action_status") {
+        if caller != crate::action_provider::ACTION_CALLER || remaining_ms == 0 {
+            return Dispatch::Immediate(rejected("unauthorized_caller"));
+        }
+        return match method {
+            "action_execute" => serde_json::from_value(args.clone())
+                .map(|r| Dispatch::ActionExecute(Box::new(r)))
+                .unwrap_or_else(|_| Dispatch::Immediate(rejected("invalid_request"))),
+            "action_status" => serde_json::from_value(args.clone())
+                .map(|r| Dispatch::ActionStatus(Box::new(r)))
+                .unwrap_or_else(|_| Dispatch::Immediate(rejected("invalid_request"))),
+            _ => serde_json::from_value(args.clone())
+                .map(|r| Dispatch::ActionPlan(Box::new(r)))
+                .unwrap_or_else(|_| Dispatch::Immediate(rejected("invalid_request"))),
+        };
+    }
     if caller != LIFECYCLE_CALLER {
         return Dispatch::Immediate(rejected("unauthorized_caller"));
     }
@@ -288,6 +386,105 @@ fn target_epoch(target: &LifecycleTarget) -> &str {
         | LifecycleTarget::Stream { host_epoch, .. }
         | LifecycleTarget::Validation { host_epoch, .. } => host_epoch,
     }
+}
+
+fn action_lifecycle_target(
+    target: &extension_api::ActionTarget,
+) -> Result<LifecycleTarget, &'static str> {
+    match target {
+        extension_api::ActionTarget::Session {
+            host_epoch,
+            session_id,
+            expected_generation,
+        } => Ok(LifecycleTarget::Session {
+            host_epoch: host_epoch.clone(),
+            session_id: session_id.clone(),
+            generation: *expected_generation,
+        }),
+        extension_api::ActionTarget::Stream {
+            host_epoch,
+            session_id,
+            stream_id,
+            expected_generation,
+        } => Ok(LifecycleTarget::Stream {
+            host_epoch: host_epoch.clone(),
+            session_id: session_id.clone(),
+            stream_id: stream_id.clone(),
+            generation: *expected_generation,
+        }),
+        extension_api::ActionTarget::Host { .. } => Err("unsupported_action_target"),
+    }
+}
+
+fn start_action_execute(
+    request: Box<crate::action_provider::ExecuteRequest>,
+    parent: u64,
+    now_ms: u64,
+    remaining_ms: u64,
+) -> Result<PendingPhase, &'static str> {
+    let timeout = remaining_ms.min(30_000);
+    let target: LifecycleTarget = serde_json::from_value(
+        request
+            .plan
+            .constraints
+            .pointer("/provider/lifecycle_target")
+            .cloned()
+            .ok_or("missing_action_target")?,
+    )
+    .map_err(|_| "invalid_action_target")?;
+    let selected = match &target {
+        LifecycleTarget::Stream {
+            host_epoch,
+            session_id,
+            stream_id,
+            generation,
+        } => extension_api::ActionTarget::Stream {
+            host_epoch: host_epoch.clone(),
+            session_id: session_id.clone(),
+            stream_id: stream_id.clone(),
+            expected_generation: *generation,
+        },
+        _ => return Err("invalid_action_target"),
+    };
+    if action_lifecycle_target(&selected)? != target
+        || !crate::action_provider::target_matches(&request.target, &selected, &target)
+    {
+        return Err("action_target_mismatch");
+    }
+    let key = target_store_key(&target)?;
+    let backend = crate::action_backend::VirtualActionBackend::new(
+        crate::action_provider::ACTION_CALLER,
+        (*request).clone(),
+        key,
+        parent,
+        timeout,
+        now_ms,
+        |_, _| true,
+    )?;
+    let store = crate::action_store::DurableActionStore::new(
+        crate::action_provider::ACTION_CALLER,
+        format!("action.{parent}"),
+        Some(parent),
+        timeout,
+        |_| true,
+    )?;
+    let operation_id = request.operation_id.clone();
+    let machine = crate::action_provider::ActionExecution::new(
+        crate::action_provider::ACTION_CALLER,
+        *request,
+        now_ms,
+        timeout,
+    )?;
+    Ok(PendingPhase::ActionExecute {
+        machine: Box::new(machine),
+        store: Box::new(store),
+        backend: Box::new(backend),
+        operation_id,
+    })
+}
+
+fn action_recovery(operation_id: &str) -> Value {
+    json!({"status":"recovery_required","receipt":{"operation_id":operation_id,"reason":"effect_unknown"}})
 }
 fn cleanup(obligations: &[extension_api::ResourceObligation]) -> Value {
     let outcomes: Vec<_> = obligations.iter().map(|obligation| json!({"obligation_id":obligation.obligation_id,"state":"released","reason":null})).collect();
@@ -482,6 +679,75 @@ fn receipt_response(request: &ProviderRequest, receipt: &crate::receipt_store::R
         recovery("unsupported_recorded_plan")
     }
 }
+fn prior_physical_cleanup(
+    prior: &crate::physical_display::RecoveryObligation,
+    plans: &[extension_api::ResourcePlan],
+    obligations: &[extension_api::ResourceObligation],
+) -> Result<
+    (
+        extension_api::ResourcePlan,
+        Vec<extension_api::ResourceObligation>,
+    ),
+    &'static str,
+> {
+    let expected = json!({"provider": crate::physical_display::SERVICE,
+        "configuration": prior.configuration, "expected_topology_revision": prior.topology_revision,
+        "expected_mutation_domain_id": prior.mutation_domain_id,
+        "expected_mutation_domain_revision": prior.mutation_domain_revision});
+    let mut matching = plans
+        .iter()
+        .filter(|plan| plan.constraints.get("physical") == Some(&expected));
+    let plan = matching.next().ok_or("release_prior_plan_unavailable")?;
+    if matching.next().is_some() {
+        return Err("release_prior_plan_ambiguous");
+    }
+    if plan.obligations.is_empty() || plan.obligations.iter().any(|o| !obligations.contains(o)) {
+        return Err("release_prior_obligation_unavailable");
+    }
+    Ok((plan.clone(), plan.obligations.clone()))
+}
+fn prior_virtual_cleanup(
+    prior: &crate::virtual_callback::VirtualObligation,
+    plans: &[extension_api::ResourcePlan],
+    obligations: &[extension_api::ResourceObligation],
+) -> Result<extension_api::ResourceObligation, &'static str> {
+    let mut expected = prior.clone();
+    expected.borrow = None;
+    let mut found = plans.iter().filter_map(|plan| {
+        let constraint: crate::virtual_callback::VirtualObligation =
+            serde_json::from_value(plan.constraints.get("virtual_display")?.clone()).ok()?;
+        if constraint != expected {
+            return None;
+        }
+        let mut matches = plan.obligations.iter().filter(|obligation| {
+            obligation.provider == crate::descriptor::PROVIDER
+                && obligation.resource_id == prior.identity
+                && obligation.mutation_domain.as_deref() == Some(prior.domain_id.as_str())
+                && obligation.cleanup_method.service == crate::descriptor::SERVICE
+                && obligation.cleanup_method.method == "lifecycle_callback"
+                && obligation.payload.get("service").and_then(Value::as_str)
+                    == Some(crate::virtual_display::SERVICE)
+                && obligation.payload.get("identity").and_then(Value::as_str)
+                    == Some(prior.identity.as_str())
+                && obligation
+                    .payload
+                    .get("reference_id")
+                    .and_then(Value::as_str)
+                    == Some(prior.reference_id.as_str())
+                && obligations.contains(obligation)
+        });
+        let found = matches.next()?.clone();
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(found)
+    });
+    let selected = found.next().ok_or("release_prior_plan_unavailable")?;
+    if found.next().is_some() {
+        return Err("release_prior_plan_ambiguous");
+    }
+    Ok(selected)
+}
 fn preparing(request: &ProviderRequest) -> bool {
     matches!(
         request.phase,
@@ -496,6 +762,244 @@ fn advance_phase(
 ) -> Result<PendingPhase, Value> {
     use crate::durable_store::LoadProgress;
     match phase {
+        PendingPhase::ActionPlan {
+            mut planner,
+            request,
+        } => match planner.poll(now_ms, send) {
+            crate::action_provider::ActionPlanProgress::Waiting => {
+                Ok(PendingPhase::ActionPlan { planner, request })
+            }
+            crate::action_provider::ActionPlanProgress::Planned(plan) => Err(
+                json!({"status":"planned","operation_id":request.operation_id,"action_id":request.action_id,"target":request.target,"plan":plan}),
+            ),
+            crate::action_provider::ActionPlanProgress::Rejected(reason) => Err(rejected(reason)),
+            _ => Err(recovery("action_plan_unknown")),
+        },
+        PendingPhase::ActionExecute {
+            mut machine,
+            mut store,
+            mut backend,
+            operation_id,
+        } => {
+            store.advance(now_ms, send);
+            backend.advance(now_ms, send);
+            match machine.poll(now_ms, send, &mut *store, &mut *backend) {
+                crate::action_provider::Progress::Waiting => Ok(PendingPhase::ActionExecute {
+                    machine,
+                    store,
+                    backend,
+                    operation_id,
+                }),
+                crate::action_provider::Progress::Complete(result) => {
+                    Err(serde_json::to_value(result)
+                        .unwrap_or_else(|_| action_recovery(&operation_id)))
+                }
+                _ => Err(action_recovery(&operation_id)),
+            }
+        }
+        PendingPhase::ActionStatus { request, mut store } => {
+            store.advance(now_ms, send);
+            match crate::action_provider::status(
+                crate::action_provider::ACTION_CALLER,
+                &request,
+                &mut *store,
+            ) {
+                crate::action_provider::Progress::Waiting => {
+                    Ok(PendingPhase::ActionStatus { request, store })
+                }
+                crate::action_provider::Progress::Complete(result) => {
+                    Err(serde_json::to_value(result)
+                        .unwrap_or_else(|_| action_recovery(&request.operation_id)))
+                }
+                crate::action_provider::Progress::Rejected(reason) => Err(rejected(reason)),
+                _ => Err(action_recovery(&request.operation_id)),
+            }
+        }
+        PendingPhase::PhysicalReleaseLoad {
+            request,
+            domains,
+            plans,
+            obligations,
+            mut store,
+        } => {
+            store.advance(now_ms, send);
+            match store.poll_load() {
+                LoadProgress::Waiting => Ok(PendingPhase::PhysicalReleaseLoad {
+                    request,
+                    domains,
+                    plans,
+                    obligations,
+                    store,
+                }),
+                LoadProgress::Found(prior) => {
+                    let (prior_plan, retained) =
+                        prior_physical_cleanup(&prior, &plans, &obligations).map_err(recovery)?;
+                    let mut matching = domains.into_iter().filter(|domain| {
+                        Some(domain.domain.as_str()) == prior.mutation_domain_id.as_deref()
+                    });
+                    let domain = matching
+                        .next()
+                        .ok_or_else(|| recovery("release_domain_unavailable"))?;
+                    if matching.next().is_some() {
+                        return Err(recovery("ambiguous_release_domain"));
+                    }
+                    let planner = crate::physical_release_plan::PhysicalReleasePlanner::new(
+                        LIFECYCLE_CALLER,
+                        *request,
+                        prior,
+                        &prior_plan.mutation_domains,
+                        Some(request_id),
+                        now_ms,
+                        |_, _| true,
+                    )
+                    .map_err(rejected)?;
+                    Ok(PendingPhase::PhysicalReleasePlan {
+                        planner: Box::new(planner),
+                        domain,
+                        obligations: retained,
+                    })
+                }
+                LoadProgress::Absent => Err(recovery("release_ownership_unavailable")),
+                LoadProgress::Unknown => Err(recovery("release_ownership_unknown")),
+            }
+        }
+        PendingPhase::PhysicalReleasePlan {
+            mut planner,
+            domain,
+            obligations,
+        } => match planner.poll(now_ms, send) {
+            crate::resource_plan::PlanProgress::Waiting => Ok(PendingPhase::PhysicalReleasePlan {
+                planner,
+                domain,
+                obligations,
+            }),
+            crate::resource_plan::PlanProgress::Complete(response) => match *response {
+                extension_api::ProviderResponse::Planned { mut plan } => {
+                    if plan.mutation_domains.len() != 1
+                        || plan.mutation_domains[0].domain != domain.domain
+                        || plan.mutation_domains[0].expected_revision != domain.expected_revision
+                    {
+                        return Err(recovery("release_domain_changed"));
+                    }
+                    plan.mutation_domains[0] = domain;
+                    plan.obligations = obligations;
+                    Err(
+                        serde_json::to_value(extension_api::ProviderResponse::Planned { plan })
+                            .unwrap_or_else(|_| recovery("invalid_plan_response")),
+                    )
+                }
+                other => Err(serde_json::to_value(other)
+                    .unwrap_or_else(|_| recovery("invalid_plan_response"))),
+            },
+            crate::resource_plan::PlanProgress::Unknown => {
+                Err(recovery("resource_planning_unknown"))
+            }
+        },
+        PendingPhase::RefreshRelease {
+            request,
+            mut refresh,
+            plans,
+            obligations,
+        } => match refresh.poll(now_ms, send) {
+            crate::observation_refresh::RefreshProgress::Waiting => {
+                Ok(PendingPhase::RefreshRelease {
+                    request,
+                    refresh,
+                    plans,
+                    obligations,
+                })
+            }
+            crate::observation_refresh::RefreshProgress::Unknown => {
+                Err(recovery("release_observation_unknown"))
+            }
+            crate::observation_refresh::RefreshProgress::Complete { domains, journals } => {
+                let mut matching = journals
+                    .into_iter()
+                    .filter(|journal| journal.target == request.target);
+                let expected = matching
+                    .next()
+                    .ok_or_else(|| recovery("release_ownership_unavailable"))?
+                    .before;
+                if matching.next().is_some() {
+                    return Err(recovery("release_ownership_ambiguous"));
+                }
+                let epoch = crate::receipt_store::VerifiedEpoch::authenticate(
+                    target_epoch(&request.target).to_owned(),
+                    |_| true,
+                )
+                .map_err(rejected)?;
+                let key = crate::durable_store::VerifiedTarget::authenticate(
+                    target_store_key(&request.target).map_err(rejected)?,
+                    |_| true,
+                )
+                .map_err(rejected)?;
+                let mut store = crate::durable_store::VirtualDurableStateStore::new(
+                    epoch,
+                    key,
+                    format!("planrelease.{request_id}"),
+                    Some(request_id),
+                    request.remaining_ms.min(30_000),
+                )
+                .map_err(rejected)?;
+                store.start_load().map_err(rejected)?;
+                Ok(PendingPhase::PlanReleaseLoad {
+                    request,
+                    expected: Box::new(expected),
+                    domains,
+                    plans,
+                    obligations,
+                    store: Box::new(store),
+                })
+            }
+        },
+        PendingPhase::PlanReleaseLoad {
+            request,
+            expected,
+            domains,
+            plans,
+            obligations,
+            mut store,
+        } => {
+            store.advance(now_ms, send);
+            match store.poll_load() {
+                LoadProgress::Waiting => Ok(PendingPhase::PlanReleaseLoad {
+                    request,
+                    expected,
+                    domains,
+                    plans,
+                    obligations,
+                    store,
+                }),
+                LoadProgress::Found(prior) => {
+                    let cleanup =
+                        prior_virtual_cleanup(&prior, &plans, &obligations).map_err(recovery)?;
+                    let mut matching = domains
+                        .into_iter()
+                        .filter(|domain| domain.domain == prior.domain_id);
+                    let domain = matching
+                        .next()
+                        .ok_or_else(|| recovery("release_domain_unavailable"))?;
+                    if matching.next().is_some() {
+                        return Err(recovery("ambiguous_release_domain"));
+                    }
+                    let planner = crate::resource_plan::Planner::new_release(
+                        LIFECYCLE_CALLER,
+                        *request,
+                        prior,
+                        crate::resource_plan::ReleaseAuthority { domain, cleanup },
+                        Some(request_id),
+                        now_ms,
+                        |_| true,
+                    )
+                    .map_err(rejected)?;
+                    Ok(PendingPhase::Plan {
+                        planner: Box::new(planner),
+                    })
+                }
+                LoadProgress::Absent => Err(recovery("release_ownership_unavailable")),
+                LoadProgress::Unknown => Err(recovery("release_ownership_unknown")),
+            }
+        }
         PendingPhase::PlanSessionLoad {
             mut planner,
             target,
@@ -688,6 +1192,97 @@ fn advance_phase(
             Verification::Unknown => Err(recovery("coordinator_verification_unknown")),
             Verification::Verified => {
                 if request.operation == ProviderOperation::ResourcePlan {
+                    if !preparing(&request)
+                        && request
+                            .settings
+                            .get("display_target")
+                            .and_then(Value::as_str)
+                            .unwrap_or("virtual")
+                            == "virtual"
+                    {
+                        let admitted = verification
+                            .admitted_plans()
+                            .ok_or_else(|| recovery("release_plans_unavailable"))?
+                            .to_vec();
+                        let obligations = verification
+                            .obligations()
+                            .ok_or_else(|| recovery("release_obligations_unavailable"))?
+                            .to_vec();
+                        let plans = admitted
+                            .iter()
+                            .filter(|p| {
+                                p.target == request.target
+                                    && matches!(
+                                        p.phase,
+                                        LifecyclePhase::SessionPrepare
+                                            | LifecyclePhase::StreamPrepare
+                                    )
+                            })
+                            .map(|p| p.plan.clone())
+                            .collect();
+                        let refresh = crate::observation_refresh::ObservationRefresh::new(
+                            request.target.clone(),
+                            admitted,
+                            obligations.clone(),
+                            Some(request_id),
+                            request.remaining_ms.min(30_000),
+                            now_ms,
+                            |_, _, _| true,
+                        )
+                        .map_err(rejected)?;
+                        return Ok(PendingPhase::RefreshRelease {
+                            request,
+                            refresh: Box::new(refresh),
+                            plans,
+                            obligations,
+                        });
+                    }
+                    if !preparing(&request)
+                        && request
+                            .settings
+                            .get("display_target")
+                            .and_then(Value::as_str)
+                            == Some("physical")
+                    {
+                        let domains = verification
+                            .mutation_domains()
+                            .ok_or_else(|| recovery("release_domains_unavailable"))?
+                            .to_vec();
+                        let epoch = crate::receipt_store::VerifiedEpoch::authenticate(
+                            target_epoch(&request.target).to_owned(),
+                            |_| true,
+                        )
+                        .map_err(rejected)?;
+                        let key = crate::durable_store::VerifiedTarget::authenticate(
+                            target_store_key(&request.target).map_err(rejected)?,
+                            |_| true,
+                        )
+                        .map_err(rejected)?;
+                        let mut store = crate::durable_store::StateDurableStore::new(
+                            epoch,
+                            key,
+                            format!("planrelease.{request_id}"),
+                            Some(request_id),
+                            request.remaining_ms.min(30_000),
+                        )
+                        .map_err(rejected)?;
+                        store.start_load().map_err(rejected)?;
+                        let plans = verification
+                            .plans()
+                            .ok_or_else(|| recovery("release_plans_unavailable"))?
+                            .to_vec();
+                        let obligations = verification
+                            .obligations()
+                            .ok_or_else(|| recovery("release_obligations_unavailable"))?
+                            .to_vec();
+                        return Ok(PendingPhase::PhysicalReleaseLoad {
+                            request,
+                            domains,
+                            plans,
+                            obligations,
+                            store: Box::new(store),
+                        });
+                    }
                     let needs_session = matches!(request.target, LifecycleTarget::Stream { .. })
                         && request
                             .settings
@@ -983,6 +1578,63 @@ impl ManagedModule for DisplaySettingsModule {
                 let now = self.clock.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                 match dispatch(&caller, &payload, now, remaining_ms) {
                     Dispatch::Immediate(result) => self.complete(id, result),
+                    Dispatch::ActionPlan(request) if self.pending.len() < MAX_PENDING => {
+                        match crate::action_provider::ActionPlanner::new(
+                            crate::action_provider::ACTION_CALLER,
+                            (*request).clone(),
+                            id,
+                            now,
+                            remaining_ms.min(30_000),
+                        ) {
+                            Ok(planner) => {
+                                self.pending.push(PendingRequest {
+                                    request_id: id,
+                                    phase: PendingPhase::ActionPlan {
+                                        planner: Box::new(planner),
+                                        request,
+                                    },
+                                });
+                                Ok(())
+                            }
+                            Err(reason) => self.complete(id, rejected(reason)),
+                        }
+                    }
+                    Dispatch::ActionPlan(_) => self.complete(id, rejected("provider_busy")),
+                    Dispatch::ActionExecute(request) if self.pending.len() < MAX_PENDING => {
+                        match start_action_execute(request, id, now, remaining_ms) {
+                            Ok(phase) => {
+                                self.pending.push(PendingRequest {
+                                    request_id: id,
+                                    phase,
+                                });
+                                Ok(())
+                            }
+                            Err(reason) => self.complete(id, rejected(reason)),
+                        }
+                    }
+                    Dispatch::ActionExecute(_) => self.complete(id, rejected("provider_busy")),
+                    Dispatch::ActionStatus(request) if self.pending.len() < MAX_PENDING => {
+                        match crate::action_store::DurableActionStore::new(
+                            crate::action_provider::ACTION_CALLER,
+                            format!("action-status.{id}"),
+                            Some(id),
+                            remaining_ms.min(30_000),
+                            |_| true,
+                        ) {
+                            Ok(store) => {
+                                self.pending.push(PendingRequest {
+                                    request_id: id,
+                                    phase: PendingPhase::ActionStatus {
+                                        request,
+                                        store: Box::new(store),
+                                    },
+                                });
+                                Ok(())
+                            }
+                            Err(reason) => self.complete(id, rejected(reason)),
+                        }
+                    }
+                    Dispatch::ActionStatus(_) => self.complete(id, rejected("provider_busy")),
                     Dispatch::Verify(request, verification) if self.pending.len() < MAX_PENDING => {
                         self.pending.push(PendingRequest {
                             request_id: id,
@@ -1103,6 +1755,26 @@ mod tests {
     fn callback_request() -> ProviderRequest {
         serde_json::from_value(json!({"provider_sequence":1,"operation":"lifecycle_callback","version":1,"transition_id":"transition-1","operation_id":"virtual-1","target":{"kind":"stream","host_epoch":"epoch-1","session_id":"session-1","stream_id":"stream-1","generation":7},"phase":"stream.prepare","settings_revision":"settings-1","settings":{},"intent":"initial","reason":null,"requested_video":null,"consumer_requirements":{"execution_domain":"desktop","capture_providers":["amaterasu.capture-pipewire/1"],"selector_schemas":["amaterasu.kwin-wl-output/1"]},"remaining_ms":5000,"plan_revision":1,"admission_id":"admission-1","approved_plan":{"plan_id":"plan-1","revision":1,"resources":[{"provider":crate::descriptor::PROVIDER,"resource_id":"9c1d707f-7229-4fc4-b6e2-91f80c626a09","incarnation":null,"expected_revision":null,"execution_domain":"desktop","mutation_domains":["provider_session:abcdef"],"access":"exclusive"}],"mutation_domains":[{"domain":"provider_session:abcdef","expected_revision":1,"borrowers":{},"access":"exclusive"}],"required_capabilities":[],"constraints":{"virtual_display":{"provider_service":"amaterasu.virtual-display/1","identity":"9c1d707f-7229-4fc4-b6e2-91f80c626a09","reference_id":"stream-1","width":1920,"height":1080,"refresh_millihz":60000,"name":"Amaterasu","hdr_enabled":false,"scale":null,"layout":"extended","domain_id":"provider_session:abcdef","domain_revision":1,"geometry_revision":3,"borrow":null,"reference_released":false}},"obligations":[{"obligation_id":"cleanup-1","provider":"nonary.display-settings","resource_id":"9c1d707f-7229-4fc4-b6e2-91f80c626a09","mutation_domain":"provider_session:abcdef","depends_on":[],"cleanup_method":{"service":"nonary.display-settings/1","method":"lifecycle_callback","interface_major":1,"interface_minor":0,"schema_revision":1},"payload":{"service":"amaterasu.virtual-display/1","identity":"9c1d707f-7229-4fc4-b6e2-91f80c626a09","reference_id":"stream-1"}}],"affected_consumers":[],"consumer_change":"reconnect_required","candidate_constraint":{"capture_provider":"amaterasu.capture-pipewire/1","selector_schema":"amaterasu.kwin-wl-output/1","resource_provider":crate::descriptor::PROVIDER,"resource_id":"9c1d707f-7229-4fc4-b6e2-91f80c626a09","incarnation":null,"execution_domain":"desktop","mode":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false},"plan_revision":1},"allowed_degradation":[]}})).unwrap()
     }
+    #[test]
+    fn release_requires_exact_live_coordinator_cleanup_and_unambiguous_prior_plan() {
+        let request = callback_request();
+        let plan = request.approved_plan.unwrap();
+        let prior: crate::virtual_callback::VirtualObligation =
+            serde_json::from_value(plan.constraints["virtual_display"].clone()).unwrap();
+        let owned = plan.obligations.clone();
+        assert_eq!(
+            prior_virtual_cleanup(&prior, std::slice::from_ref(&plan), &owned).unwrap(),
+            owned[0]
+        );
+        assert_eq!(
+            prior_virtual_cleanup(&prior, std::slice::from_ref(&plan), &[]).unwrap_err(),
+            "release_prior_plan_unavailable"
+        );
+        assert_eq!(
+            prior_virtual_cleanup(&prior, &[plan.clone(), plan], &owned).unwrap_err(),
+            "release_prior_plan_ambiguous"
+        );
+    }
     #[derive(Default)]
     struct FakeBroker {
         state_revision: u64,
@@ -1116,6 +1788,11 @@ mod tests {
         deny_after_checks: Option<usize>,
         check_count: usize,
         borrow_invalid: bool,
+        action_description: Option<Value>,
+        action_collections: std::collections::BTreeMap<
+            String,
+            (u64, Value, std::collections::BTreeMap<String, Value>),
+        >,
     }
     impl FakeBroker {
         fn send(&mut self, command: Command) -> ModuleResult<Response> {
@@ -1137,7 +1814,35 @@ mod tests {
                 Command::Request {
                     service, payload, ..
                 } => {
-                    let response = if service == "amaterasu.state/1" {
+                    let response = if service == "amaterasu.state/1"
+                        && payload["collection"]
+                            .as_str()
+                            .is_some_and(|name| name.starts_with("display-settings/action-"))
+                    {
+                        let name = payload["collection"].as_str().unwrap().to_owned();
+                        let (revision, metadata, values) =
+                            self.action_collections.entry(name).or_default();
+                        match payload["action"].as_str().unwrap() {
+                            "collection_get" => {
+                                json!({"ok":true,"revision":*revision,"found":*revision!=0,"metadata":metadata,"count":values.len(),"value":values.get(payload["key"].as_str().unwrap())})
+                            }
+                            "collection_commit" => {
+                                assert_eq!(payload["expected_revision"].as_u64(), Some(*revision));
+                                for edit in payload["edits"].as_array().unwrap() {
+                                    let key = edit["key"].as_str().unwrap().to_owned();
+                                    if edit["value"].is_null() {
+                                        values.remove(&key);
+                                    } else {
+                                        values.insert(key, edit["value"].clone());
+                                    }
+                                }
+                                *metadata = payload["metadata"].clone();
+                                *revision += 1;
+                                json!({"ok":true,"revision":*revision})
+                            }
+                            _ => panic!("unexpected action collection"),
+                        }
+                    } else if service == "amaterasu.state/1" {
                         match payload["action"].as_str().unwrap() {
                             "get" => {
                                 let value = self.values.get(payload["key"].as_str().unwrap());
@@ -1177,6 +1882,10 @@ mod tests {
                             }
                             _ => panic!("unexpected state operation"),
                         }
+                    } else if service == "amaterasu.session-lifecycle/1"
+                        && payload["operation"] == "describe_action_target"
+                    {
+                        self.action_description.clone().expect("action description")
                     } else if service == "amaterasu.session-lifecycle/1" {
                         let mut answer = payload;
                         answer["status"] = "succeeded".into();
@@ -1281,8 +1990,11 @@ mod tests {
         let response = broker.drive_effect(prepare.clone());
         assert_eq!(response["status"], "prepared");
         assert_eq!(
-            response["candidate"]["resource"]["incarnation"],
-            "a".repeat(64)
+            response["candidate"]["resource"]["incarnation"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
         );
         assert_eq!(broker.effects, ["create", "borrow", "validate_borrow"]);
         let status = broker.status(1, "virtual-1");
@@ -1541,5 +2253,109 @@ mod tests {
         assert!(
             matches!(advance_phase(phase, 77, 3, &mut send),Err(response) if response["status"]=="rejected")
         );
+    }
+    #[test]
+    fn action_endpoints_require_the_installed_actions_caller() {
+        let payload = json!({"method":"action_execute","interface_major":1,"interface_minor":0,"arguments":{}});
+        assert!(
+            matches!(dispatch("untrusted",&payload,0,100),Dispatch::Immediate(response) if response["reason"]=="unauthorized_caller")
+        );
+        assert!(
+            matches!(dispatch(crate::action_provider::ACTION_CALLER,&payload,0,100),Dispatch::Immediate(response) if response["reason"]=="invalid_request")
+        );
+        let target:extension_api::ActionTarget=serde_json::from_value(json!({"kind":"stream","host_epoch":"e","session_id":"s","stream_id":"x","expected_generation":4})).unwrap();
+        assert!(matches!(
+            action_lifecycle_target(&target),
+            Ok(LifecycleTarget::Stream { generation: 4, .. })
+        ));
+    }
+    #[test]
+    fn action_planner_and_dispatch_remove_exact_owned_virtual_reference() {
+        let epoch = "0123456789abcdef0123456789abcdef";
+        let mut prepare = callback_request();
+        if let LifecycleTarget::Stream { host_epoch, .. } = &mut prepare.target {
+            *host_epoch = epoch.into();
+        }
+        let mut broker = FakeBroker::default();
+        let prepared = broker.drive_effect(prepare.clone());
+        assert_eq!(prepared["status"], "prepared");
+        let target = json!({"kind":"stream","host_epoch":epoch,"session_id":"session-1","stream_id":"stream-1","expected_generation":7});
+        broker.action_description = Some(
+            json!({"status":"succeeded","provider":crate::descriptor::PROVIDER,"target":target,"session_target":{"kind":"session","host_epoch":epoch,"session_id":"session-1","generation":1},"execution_domain":"desktop","settings_revision":"frozen-1","settings":{},"streams":[{"target":target,"lifecycle_target":prepare.target,"phase":"active","candidate":prepared["candidate"],"consumers_retired":false}],"obligations":prepared["obligations"],"plans":[],"mutation_domains":{"provider_session:abcdef":{"revision":2,"borrowers":{"stream-1":7}}}}),
+        );
+        let request:crate::action_provider::PlanRequest=serde_json::from_value(json!({"version":1,"operation_id":format!("{epoch}:1"),"action_id":crate::actions::REMOVE_OWNED,"target":target,"arguments":{},"expected_settings_revision":null})).unwrap();
+        let planner = crate::action_provider::ActionPlanner::new(
+            crate::action_provider::ACTION_CALLER,
+            request.clone(),
+            77,
+            0,
+            5000,
+        )
+        .unwrap();
+        let mut phase = PendingPhase::ActionPlan {
+            planner: Box::new(planner),
+            request: Box::new(request.clone()),
+        };
+        let mut plan = None;
+        for tick in 1..500 {
+            match advance_phase(phase, 77, tick, &mut |c| broker.send(c)) {
+                Ok(next) => phase = next,
+                Err(result) => {
+                    assert_eq!(result["status"], "planned", "{result}");
+                    plan = Some(result["plan"].clone());
+                    break;
+                }
+            }
+        }
+        let plan = plan.expect("planner did not finish");
+        assert_eq!(
+            plan["constraints"]["selected_settings_revision"],
+            "frozen-1"
+        );
+        let plan: extension_api::ResourcePlan = serde_json::from_value(plan).unwrap();
+        let execute = crate::action_provider::ExecuteRequest {
+            version: 1,
+            operation_id: request.operation_id.clone(),
+            action_id: request.action_id.clone(),
+            target: request.target.clone(),
+            arguments: request.arguments.clone(),
+            expected_settings_revision: None,
+            plan_digest: crate::action_provider::plan_digest(&plan).unwrap(),
+            plan,
+            permit: "permit-1".into(),
+        };
+        let mut phase = start_action_execute(Box::new(execute.clone()), 77, 0, 5000).unwrap();
+        let mut outcome = Value::Null;
+        for tick in 1..500 {
+            match advance_phase(phase, 77, tick, &mut |c| broker.send(c)) {
+                Ok(next) => phase = next,
+                Err(result) => {
+                    outcome = result;
+                    break;
+                }
+            }
+        }
+        assert_eq!(outcome["status"], "succeeded", "{outcome}");
+        assert!(
+            broker
+                .effects
+                .ends_with(&["release_borrow".into(), "remove".into()])
+        );
+        let original_effects = broker.effects.clone();
+        // A new dispatcher instance after restart must replay the durable terminal
+        // receipt rather than invoke the native backend for the same operation.
+        let mut restarted = start_action_execute(Box::new(execute), 78, 0, 5000).unwrap();
+        let mut replay = Value::Null;
+        for tick in 1..500 {
+            match advance_phase(restarted, 78, tick, &mut |c| broker.send(c)) {
+                Ok(next) => restarted = next,
+                Err(result) => {
+                    replay = result;
+                    break;
+                }
+            }
+        }
+        assert_eq!(replay["status"], "succeeded", "{replay}");
+        assert_eq!(broker.effects, original_effects);
     }
 }

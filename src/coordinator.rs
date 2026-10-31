@@ -1,5 +1,7 @@
 //! Verify an effect callback against the selected coordinator's durable admission.
-use amaterasu_module_sdk::extension_api::{LifecycleTarget, ProviderRequest};
+use amaterasu_module_sdk::extension_api::{
+    LifecycleTarget, MutationDomainPlan, ProviderRequest, ResourceObligation, ResourcePlan,
+};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -36,6 +38,10 @@ pub struct PendingVerification {
     done: Option<Verification>,
     session_target: Option<LifecycleTarget>,
     consumers_retired: Option<bool>,
+    mutation_domains: Option<Vec<MutationDomainPlan>>,
+    plans: Option<Vec<ResourcePlan>>,
+    admitted_plans: Option<Vec<crate::observation_refresh::AdmittedPlan>>,
+    obligations: Option<Vec<ResourceObligation>>,
 }
 impl PendingVerification {
     pub fn from_request(
@@ -113,6 +119,10 @@ impl PendingVerification {
             done: None,
             session_target: None,
             consumers_retired: None,
+            mutation_domains: None,
+            plans: None,
+            admitted_plans: None,
+            obligations: None,
         })
     }
     /// Canonical parent supplied by the authenticated coordinator after verification.
@@ -125,6 +135,36 @@ impl PendingVerification {
     pub fn consumers_retired(&self) -> Option<bool> {
         if self.done == Some(Verification::Verified) {
             self.consumers_retired
+        } else {
+            None
+        }
+    }
+    /// Current provider-scoped coordinator domain snapshot, when supplied.
+    pub fn mutation_domains(&self) -> Option<&[MutationDomainPlan]> {
+        if self.done == Some(Verification::Verified) {
+            self.mutation_domains.as_deref()
+        } else {
+            None
+        }
+    }
+    /// Previously admitted plans and obligations selected by the coordinator.
+    pub fn plans(&self) -> Option<&[ResourcePlan]> {
+        if self.done == Some(Verification::Verified) {
+            self.plans.as_deref()
+        } else {
+            None
+        }
+    }
+    pub fn admitted_plans(&self) -> Option<&[crate::observation_refresh::AdmittedPlan]> {
+        if self.done == Some(Verification::Verified) {
+            self.admitted_plans.as_deref()
+        } else {
+            None
+        }
+    }
+    pub fn obligations(&self) -> Option<&[ResourceObligation]> {
+        if self.done == Some(Verification::Verified) {
+            self.obligations.as_deref()
         } else {
             None
         }
@@ -165,6 +205,41 @@ impl PendingVerification {
                             self.session_target = selected.flatten();
                             self.consumers_retired =
                                 reply.get("consumers_retired").and_then(Value::as_bool);
+                            self.mutation_domains =
+                                reply.get("mutation_domains").and_then(|value| {
+                                    let domains: Vec<MutationDomainPlan> =
+                                        serde_json::from_value(value.clone()).ok()?;
+                                    (domains.len() <= 128).then_some(domains)
+                                });
+                            self.plans = reply.get("plans").and_then(|value| {
+                                let plans: Vec<ResourcePlan> =
+                                    serde_json::from_value(value.clone()).ok()?;
+                                (plans.len() <= 128
+                                    && plans.iter().all(|plan| {
+                                        amaterasu_module_sdk::extension_api::validate_resource_plan(
+                                            plan,
+                                        )
+                                        .is_ok()
+                                    }))
+                                .then_some(plans)
+                            });
+                            self.admitted_plans = reply.get("admitted_plans").and_then(|value| {
+                                let plans: Vec<crate::observation_refresh::AdmittedPlan> =
+                                    serde_json::from_value(value.clone()).ok()?;
+                                (plans.len() <= 128
+                                    && plans.iter().all(|entry| {
+                                        amaterasu_module_sdk::extension_api::validate_resource_plan(
+                                            &entry.plan,
+                                        )
+                                        .is_ok()
+                                    }))
+                                .then_some(plans)
+                            });
+                            self.obligations = reply.get("obligations").and_then(|value| {
+                                let obligations: Vec<ResourceObligation> =
+                                    serde_json::from_value(value.clone()).ok()?;
+                                (obligations.len() <= 128).then_some(obligations)
+                            });
                             self.finish(Verification::Verified)
                         } else {
                             self.finish(Verification::Rejected)
