@@ -23,6 +23,9 @@ const REGISTERED_METHODS: &[&str] = &[
     "lifecycle_callback",
     "lifecycle_status",
     "binding_validate",
+    "action_plan",
+    "action_execute",
+    "action_status",
 ];
 
 pub struct DisplaySettingsModule {
@@ -1908,6 +1911,11 @@ mod tests {
                         && payload["operation"] == "describe_action_target"
                     {
                         self.action_description.clone().expect("action description")
+                    } else if service == "amaterasu.session-lifecycle/1"
+                        && payload["operation"] == "refresh_provider_observations"
+                    {
+                        let domain = &payload["domains"][0];
+                        json!({"status":"succeeded","operation_id":payload["operation_id"],"target":payload["target"],"mutation_domains":[{"domain":domain["domain"],"expected_revision":domain["revision"],"borrowers":domain["borrowers"],"access":"exclusive"}],"stale_mutation_domains":[]})
                     } else if service == "amaterasu.session-lifecycle/1" {
                         let mut answer = payload;
                         answer["status"] = "succeeded".into();
@@ -1924,6 +1932,9 @@ mod tests {
                         self.effects.push(action.into());
                         let domain = json!({"id":"provider_session:abcdef","revision":2,"borrowers":1,"pending_mutations":0,"scope":"provider_session"});
                         match action {
+                            "status" => {
+                                json!({"ok":true,"enabled":true,"native_supported":true,"recovery_ready":true,"mutation_domain":domain})
+                            }
                             "create" => {
                                 assert!(self.metadata["pending"] == 1);
                                 assert!(self.values.values().any(|value| value["identity"]
@@ -2303,7 +2314,7 @@ mod tests {
         assert_eq!(prepared["status"], "prepared");
         let target = json!({"kind":"stream","host_epoch":epoch,"session_id":"session-1","stream_id":"stream-1","expected_generation":7});
         broker.action_description = Some(
-            json!({"status":"succeeded","provider":crate::descriptor::PROVIDER,"target":target,"session_target":{"kind":"session","host_epoch":epoch,"session_id":"session-1","generation":1},"execution_domain":"desktop","settings_revision":"frozen-1","settings":{},"streams":[{"target":target,"lifecycle_target":prepare.target,"phase":"active","candidate":prepared["candidate"],"consumers_retired":false}],"obligations":prepared["obligations"],"plans":[],"mutation_domains":{"provider_session:abcdef":{"revision":2,"borrowers":{"stream-1":7}}}}),
+            json!({"status":"succeeded","provider":crate::descriptor::PROVIDER,"target":target,"session_target":{"kind":"session","host_epoch":epoch,"session_id":"session-1","generation":1},"execution_domain":"desktop","settings_revision":"frozen-1","settings":{},"streams":[{"target":target,"lifecycle_target":prepare.target,"phase":"active","candidate":prepared["candidate"],"consumers_retired":false}],"obligations":prepared["obligations"],"observation_obligations":prepared["obligations"],"admitted_plans":[{"admission_id":"admission-1","target":prepare.target,"phase":"stream.prepare","plan":prepare.approved_plan}],"plans":[],"mutation_domains":{"provider_session:abcdef":{"revision":2,"borrowers":{"stream-1":7}}}}),
         );
         let request:crate::action_provider::PlanRequest=serde_json::from_value(json!({"version":1,"operation_id":format!("{epoch}:1"),"action_id":crate::actions::REMOVE_OWNED,"target":target,"arguments":{},"expected_settings_revision":null})).unwrap();
         let planner = crate::action_provider::ActionPlanner::new(

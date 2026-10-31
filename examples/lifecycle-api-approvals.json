@@ -238,6 +238,150 @@
         "service": "nonary.display-settings/1"
       },
       "provider": "nonary.display-settings"
+    },
+    {
+      "callers": [
+        "amaterasu.extension-actions"
+      ],
+      "method": {
+        "interface_major": 1,
+        "interface_minor": 0,
+        "method": "action_plan",
+        "privilege": "user",
+        "request": {
+          "allow_extra": false,
+          "optional": {},
+          "required": {
+            "action_id": "string",
+            "arguments": "object",
+            "expected_settings_revision": "any",
+            "operation_id": "string",
+            "target": "object",
+            "version": "integer"
+          }
+        },
+        "response": {
+          "allow_extra": false,
+          "optional": {
+            "action_id": "string",
+            "binding": "object",
+            "candidate": "any",
+            "cleanup_complete": "boolean",
+            "obligations": "array",
+            "observation": "object",
+            "operation_id": "string",
+            "outcomes": "array",
+            "plan": "object",
+            "plan_revision": "integer",
+            "reason": "string",
+            "receipt": "object",
+            "receipt_id": "string",
+            "target": "object"
+          },
+          "required": {
+            "status": "string"
+          }
+        },
+        "service": "nonary.display-settings/1"
+      },
+      "provider": "nonary.display-settings"
+    },
+    {
+      "callers": [
+        "amaterasu.extension-actions"
+      ],
+      "method": {
+        "interface_major": 1,
+        "interface_minor": 0,
+        "method": "action_execute",
+        "privilege": "user",
+        "request": {
+          "allow_extra": false,
+          "optional": {},
+          "required": {
+            "action_id": "string",
+            "arguments": "object",
+            "expected_settings_revision": "any",
+            "operation_id": "string",
+            "permit": "string",
+            "plan": "object",
+            "plan_digest": "string",
+            "target": "object",
+            "version": "integer"
+          }
+        },
+        "response": {
+          "allow_extra": false,
+          "optional": {
+            "action_id": "string",
+            "binding": "object",
+            "candidate": "any",
+            "cleanup_complete": "boolean",
+            "obligations": "array",
+            "observation": "object",
+            "operation_id": "string",
+            "outcomes": "array",
+            "plan": "object",
+            "plan_revision": "integer",
+            "reason": "string",
+            "receipt": "object",
+            "receipt_id": "string",
+            "target": "object"
+          },
+          "required": {
+            "status": "string"
+          }
+        },
+        "service": "nonary.display-settings/1"
+      },
+      "provider": "nonary.display-settings"
+    },
+    {
+      "callers": [
+        "amaterasu.extension-actions"
+      ],
+      "method": {
+        "interface_major": 1,
+        "interface_minor": 0,
+        "method": "action_status",
+        "privilege": "user",
+        "request": {
+          "allow_extra": false,
+          "optional": {},
+          "required": {
+            "action_id": "string",
+            "operation_id": "string",
+            "plan_digest": "string",
+            "provider_receipt": "object",
+            "target": "object",
+            "version": "integer"
+          }
+        },
+        "response": {
+          "allow_extra": false,
+          "optional": {
+            "action_id": "string",
+            "binding": "object",
+            "candidate": "any",
+            "cleanup_complete": "boolean",
+            "obligations": "array",
+            "observation": "object",
+            "operation_id": "string",
+            "outcomes": "array",
+            "plan": "object",
+            "plan_revision": "integer",
+            "reason": "string",
+            "receipt": "object",
+            "receipt_id": "string",
+            "target": "object"
+          },
+          "required": {
+            "status": "string"
+          }
+        },
+        "service": "nonary.display-settings/1"
+      },
+      "provider": "nonary.display-settings"
     }
   ]
 }

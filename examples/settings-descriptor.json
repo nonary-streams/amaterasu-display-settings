@@ -405,7 +405,41 @@
       "required_capabilities": []
     }
   ],
-  "actions": [],
+  "actions": [
+    {
+      "id": "nonary.display-settings/remove-owned",
+      "label": "remove owned",
+      "description": "Changes a display owned by the selected session after its consumers retire.",
+      "execution": "session_mutation",
+      "arguments": {},
+      "allowed_targets": [
+        "session",
+        "stream"
+      ],
+      "required_capabilities": [],
+      "plan": {
+        "service": "nonary.display-settings/1",
+        "method": "action_plan",
+        "interface_major": 1,
+        "interface_minor": 0,
+        "schema_revision": 1
+      },
+      "execute": {
+        "service": "nonary.display-settings/1",
+        "method": "action_execute",
+        "interface_major": 1,
+        "interface_minor": 0,
+        "schema_revision": 1
+      },
+      "status": {
+        "service": "nonary.display-settings/1",
+        "method": "action_status",
+        "interface_major": 1,
+        "interface_minor": 0,
+        "schema_revision": 1
+      }
+    }
+  ],
   "capabilities": [],
   "settings_validate": {
     "service": "nonary.display-settings/1",

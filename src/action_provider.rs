@@ -613,10 +613,14 @@ pub struct ActionPlanner {
     store: Option<crate::durable_store::VirtualDurableStateStore>,
     obligation: Option<crate::virtual_callback::VirtualObligation>,
     borrow: Option<crate::virtual_display::PendingCall>,
+    refresh: Option<crate::observation_refresh::ObservationRefresh>,
+    writer: Option<crate::action_runtime::ObservationWriter>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PlannerPhase {
     Describe,
+    Refresh,
+    Persist,
     Load,
     Borrow,
     Done,
@@ -682,6 +686,8 @@ impl ActionPlanner {
             store: None,
             obligation: None,
             borrow: None,
+            refresh: None,
+            writer: None,
         })
     }
     pub fn poll(
@@ -705,6 +711,32 @@ impl ActionPlanner {
                                 let payload = self.reply.take().expect("reply");
                                 match parse_description(&self.request, &payload) {
                                     Ok(description) => {
+                                        let mut plans: Vec<
+                                            crate::observation_refresh::AdmittedPlan,
+                                        > = match serde_json::from_value(
+                                            payload["admitted_plans"].clone(),
+                                        ) {
+                                            Ok(value) => value,
+                                            Err(_) => {
+                                                self.phase = PlannerPhase::Done;
+                                                return ActionPlanProgress::Unknown;
+                                            }
+                                        };
+                                        plans.retain(|entry| {
+                                            entry.plan.mutation_domains.iter().any(|domain| {
+                                                domain.domain == description.domain.domain
+                                            })
+                                        });
+                                        let obligations: Vec<ResourceObligation> = plans
+                                            .iter()
+                                            .flat_map(|entry| {
+                                                entry.plan.obligations.iter().cloned()
+                                            })
+                                            .collect();
+                                        let refresh = match crate::observation_refresh::ObservationRefresh::new(description.target.clone(), plans, obligations, Some(self.parent), self.deadline_ms.saturating_sub(now_ms).min(30_000), now_ms, |_,_,_|true) {
+                                            Ok(value) => value,
+                                            Err(_) => { self.phase=PlannerPhase::Done; return ActionPlanProgress::Unknown; }
+                                        };
                                         let target = &description.target;
                                         let epoch = match target {
                                             extension_api::LifecycleTarget::Stream {
@@ -744,7 +776,8 @@ impl ActionPlanner {
                                             Ok(store) => {
                                                 self.store = Some(store);
                                                 self.description = Some(description);
-                                                self.phase = PlannerPhase::Load;
+                                                self.refresh = Some(refresh);
+                                                self.phase = PlannerPhase::Refresh;
                                                 ActionPlanProgress::Waiting
                                             }
                                             Err(_) => {
@@ -790,6 +823,64 @@ impl ActionPlanner {
                     }
                 }
             }
+            PlannerPhase::Refresh => {
+                match self.refresh.as_mut().expect("refresh").poll(now_ms, send) {
+                    crate::observation_refresh::RefreshProgress::Waiting => {
+                        ActionPlanProgress::Waiting
+                    }
+                    crate::observation_refresh::RefreshProgress::Unknown => {
+                        self.phase = PlannerPhase::Done;
+                        ActionPlanProgress::Unknown
+                    }
+                    crate::observation_refresh::RefreshProgress::Complete { domains, journals } => {
+                        let description = self.description.as_mut().expect("description");
+                        let mut matching = domains
+                            .into_iter()
+                            .filter(|domain| domain.domain == description.domain.domain);
+                        let Some(domain) = matching.next() else {
+                            self.phase = PlannerPhase::Done;
+                            return ActionPlanProgress::Unknown;
+                        };
+                        if matching.next().is_some() {
+                            self.phase = PlannerPhase::Done;
+                            return ActionPlanProgress::Unknown;
+                        }
+                        description.domain = domain;
+                        match crate::action_runtime::ObservationWriter::new(
+                            journals,
+                            self.parent,
+                            now_ms,
+                            self.deadline_ms.saturating_sub(now_ms),
+                        ) {
+                            Ok(writer) => {
+                                self.writer = Some(writer);
+                                self.refresh = None;
+                                self.phase = PlannerPhase::Persist;
+                                ActionPlanProgress::Waiting
+                            }
+                            Err(_) => {
+                                self.phase = PlannerPhase::Done;
+                                ActionPlanProgress::Unknown
+                            }
+                        }
+                    }
+                }
+            }
+            PlannerPhase::Persist => match self.writer.as_mut().expect("writer").poll(now_ms, send)
+            {
+                crate::action_runtime::ObservationWriteProgress::Waiting => {
+                    ActionPlanProgress::Waiting
+                }
+                crate::action_runtime::ObservationWriteProgress::Complete => {
+                    self.writer = None;
+                    self.phase = PlannerPhase::Load;
+                    ActionPlanProgress::Waiting
+                }
+                crate::action_runtime::ObservationWriteProgress::Unknown => {
+                    self.phase = PlannerPhase::Done;
+                    ActionPlanProgress::Unknown
+                }
+            },
             PlannerPhase::Load => {
                 let store = self.store.as_mut().expect("store");
                 store.advance(now_ms, send);
@@ -879,7 +970,7 @@ impl ActionPlanner {
                             provider: descriptor::PROVIDER.into(),
                             resource_id: description.candidate.resource.resource_id.clone(),
                             incarnation: Some(description.candidate.resource.incarnation.clone()),
-                            expected_revision: Some(description.candidate.resource.revision),
+                            expected_revision: Some(description.domain.expected_revision),
                             execution_domain: description
                                 .candidate
                                 .resource
@@ -1096,7 +1187,7 @@ fn obligation_matches(
                 &borrow.observed_output,
             )
         && binding.resource.mutation_domain.as_deref() == Some(obligation.domain_id.as_str())
-        && binding.resource.revision == borrow.mutation_domain.revision
+        && binding.resource.revision <= borrow.mutation_domain.revision
         && binding.mode.width == obligation.width
         && binding.mode.height == obligation.height
         && binding.mode.refresh_millihz == obligation.refresh_millihz

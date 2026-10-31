@@ -35,8 +35,7 @@ pub fn descriptor() -> ExtensionDescriptor {
         provider: PROVIDER.into(),
         revision: 1,
         options,
-        // Enable only after action planning, native execution and approvals work.
-        actions: vec![],
+        actions: vec![action_descriptor(crate::actions::REMOVE_OWNED)],
         capabilities: vec![],
         settings_validate: MethodRef {
             service: SERVICE.into(),
@@ -114,7 +113,8 @@ mod tests {
             descriptor.options.len(),
             crate::settings_schema::definitions().len()
         );
-        assert!(descriptor.actions.is_empty());
+        assert_eq!(descriptor.actions.len(), 1);
+        assert_eq!(descriptor.actions[0].id, crate::actions::REMOVE_OWNED);
         assert_eq!(super::action_descriptors().len(), 3);
     }
 }
