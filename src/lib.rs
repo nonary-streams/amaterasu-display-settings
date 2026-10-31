@@ -6,6 +6,7 @@ pub mod settings;
 
 pub mod descriptor;
 mod module;
+pub mod physical_callback;
 pub mod physical_display;
 pub mod receipt_store;
 pub mod settings_schema;
