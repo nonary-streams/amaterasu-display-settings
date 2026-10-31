@@ -2495,3 +2495,110 @@ mod prior_receipt_tests {
         assert_eq!(run(expired), PriorReceiptProgress::Expired);
     }
 }
+
+#[cfg(test)]
+mod callback_retirement_tests {
+    use super::*;
+    use crate::virtual_callback::{self, EffectGuard, EffectKind, GuardProgress, VirtualCallback};
+    use amaterasu_module_sdk::extension_api::ProviderRequest;
+    struct AllowGuard;
+    impl EffectGuard for AllowGuard {
+        fn poll(
+            &mut self,
+            _: &ProviderRequest,
+            _: EffectKind,
+            _: u64,
+            _: u64,
+            _: &mut impl FnMut(Command) -> ModuleResult<Response>,
+        ) -> GuardProgress {
+            GuardProgress::Authorized
+        }
+    }
+    fn request(sequence: u64) -> ProviderRequest {
+        let id = "9c1d707f-7229-4fc4-b6e2-91f80c626a09";
+        let domain = "provider_session:abcdef";
+        serde_json::from_value(json!({"provider_sequence":sequence,"operation":"lifecycle_callback","version":1,"transition_id":format!("transition-{sequence}"),"operation_id":format!("virtual-{sequence}"),"target":{"kind":"stream","host_epoch":"epoch-a","session_id":"session-1","stream_id":"stream-1","generation":7},"phase":"stream.prepare","settings_revision":"settings-1","settings":{},"intent":"initial","reason":null,"requested_video":null,"consumer_requirements":{"execution_domain":"desktop","capture_providers":["amaterasu.capture-pipewire/1"],"selector_schemas":["amaterasu.kwin-wl-output/1"]},"remaining_ms":5000,"plan_revision":1,"admission_id":"admission-1","approved_plan":{"plan_id":"plan-1","revision":1,"resources":[{"provider":crate::descriptor::PROVIDER,"resource_id":id,"incarnation":null,"expected_revision":null,"execution_domain":"desktop","mutation_domains":[domain],"access":"exclusive"}],"mutation_domains":[{"domain":domain,"expected_revision":1,"borrowers":{},"access":"exclusive"}],"required_capabilities":[],"constraints":{"virtual_display":{"provider_service":crate::virtual_display::SERVICE,"identity":id,"reference_id":"stream-1","width":1920,"height":1080,"refresh_millihz":60000,"name":"Amaterasu","hdr_enabled":false,"scale":null,"layout":"extended","domain_id":domain,"domain_revision":1,"geometry_revision":3,"borrow":null,"reference_released":false}},"obligations":[{"obligation_id":"cleanup-1","provider":crate::descriptor::PROVIDER,"resource_id":id,"mutation_domain":domain,"depends_on":[],"cleanup_method":{"service":crate::descriptor::SERVICE,"method":"lifecycle_callback","interface_major":1,"interface_minor":0,"schema_revision":1},"payload":{"service":crate::virtual_display::SERVICE,"identity":id,"reference_id":"stream-1"}}],"affected_consumers":[],"consumer_change":"reconnect_required","candidate_constraint":{"capture_provider":"amaterasu.capture-pipewire/1","selector_schema":"amaterasu.kwin-wl-output/1","resource_provider":crate::descriptor::PROVIDER,"resource_id":id,"incarnation":null,"execution_domain":"desktop","mode":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false},"plan_revision":1},"allowed_degradation":[]}})).unwrap()
+    }
+    #[test]
+    fn callback_receipt_window_rolls_over_without_erasing_obligations() {
+        let mut state = super::tests::FakeState::default();
+        for sequence in 1..=70 {
+            let epoch = VerifiedEpoch::authenticate("epoch-a".into(), |_| true).unwrap();
+            let target = VerifiedTarget::authenticate("session-1".into(), |_| true).unwrap();
+            let mut store = VirtualDurableStateStore::new(
+                epoch,
+                target,
+                format!("callback-{sequence}"),
+                None,
+                5000,
+            )
+            .unwrap();
+            let mut callback = VirtualCallback::new(
+                "amaterasu.session-lifecycle",
+                request(sequence),
+                None,
+                |_| true,
+                0,
+                Some(99),
+            )
+            .unwrap();
+            let mut guard = AllowGuard;
+            let mut completed = false;
+            for tick in 0..200 {
+                let mut send = |command: Command| match &command {
+                    Command::Request { service, .. }
+                        if service == crate::virtual_display::SERVICE =>
+                    {
+                        Ok(Response::Error {
+                            code: "disabled".into(),
+                            message: "test rejection".into(),
+                        })
+                    }
+                    _ => state.send(command),
+                };
+                store.advance(tick, &mut send);
+                match callback.poll(tick, &mut send, &mut store, &mut guard) {
+                    virtual_callback::CallbackProgress::Waiting => {}
+                    virtual_callback::CallbackProgress::Complete(
+                        virtual_callback::CallbackResult::Rejected { .. },
+                    ) => {
+                        completed = true;
+                        break;
+                    }
+                    other => panic!("callback {sequence}: {other:?}"),
+                }
+            }
+            assert!(completed, "callback {sequence} did not complete");
+        }
+        let mut lookup = PriorReceiptLookup::new(
+            "amaterasu.session-lifecycle",
+            1,
+            "virtual-1".into(),
+            "retired-check".into(),
+            None,
+            1000,
+            0,
+        )
+        .unwrap();
+        let mut outcome = PriorReceiptProgress::Waiting;
+        for tick in 0..10 {
+            outcome = lookup.poll(tick, &mut |command| state.send(command));
+            if outcome != PriorReceiptProgress::Waiting {
+                break;
+            }
+        }
+        assert_eq!(outcome, PriorReceiptProgress::Expired);
+        let epoch = VerifiedEpoch::authenticate("epoch-a".into(), |_| true).unwrap();
+        let target = VerifiedTarget::authenticate("session-1".into(), |_| true).unwrap();
+        let mut load =
+            VirtualDurableStateStore::new(epoch, target, "obligation-check".into(), None, 1000)
+                .unwrap();
+        load.start_load().unwrap();
+        for tick in 0..3 {
+            load.advance(tick, &mut |command| state.send(command));
+        }
+        assert!(
+            matches!(load.poll_load(),LoadProgress::Found(obligation) if obligation.reference_released)
+        );
+    }
+}

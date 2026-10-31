@@ -217,6 +217,7 @@ pub enum Progress {
 #[derive(Clone, Copy)]
 enum Phase {
     Read,
+    ReadOldest,
     Write,
 }
 struct Exchange {
@@ -240,6 +241,7 @@ pub struct PendingStoreOperation {
     exchange: Exchange,
     write_outcome: Option<Outcome>,
     write_revision: Option<u64>,
+    retirement: Option<(Metadata, u64)>,
     finished: Option<Outcome>,
 }
 impl PendingStoreOperation {
@@ -277,6 +279,7 @@ impl PendingStoreOperation {
             },
             write_outcome: None,
             write_revision: None,
+            retirement: None,
             finished: None,
         };
         call.start_read();
@@ -381,6 +384,7 @@ impl PendingStoreOperation {
         }
         match self.phase {
             Phase::Read => self.consume_read(payload),
+            Phase::ReadOldest => self.consume_oldest(payload),
             Phase::Write => {
                 if payload.get("revision").and_then(Value::as_u64) != self.write_revision {
                     return self.done(Outcome::Unknown);
@@ -459,7 +463,13 @@ impl PendingStoreOperation {
                     return self.done(Outcome::SequenceWindow);
                 }
                 if count >= WINDOW {
-                    return self.done(Outcome::Capacity);
+                    let Some(oldest) = meta.low.checked_add(1) else {
+                        return self.done(Outcome::Unknown);
+                    };
+                    self.retirement = Some((meta, revision));
+                    self.set_exchange(json!({"action":"collection_get","collection":COLLECTION,"key":format!("{oldest:020}")}), "oldest");
+                    self.phase = Phase::ReadOldest;
+                    return Progress::Waiting;
                 }
                 meta.high = *sequence;
                 meta.pending += 1;
@@ -540,6 +550,67 @@ impl PendingStoreOperation {
     fn done(&mut self, result: Outcome) -> Progress {
         self.finished = Some(result.clone());
         Progress::Done(result)
+    }
+    /// Read and validate the oldest result before deleting it in the same CAS
+    /// that admits the new pending record. Separate recovery journals remain.
+    fn consume_oldest(&mut self, payload: Value) -> Progress {
+        let Some((mut metadata, revision)) = self.retirement.take() else {
+            return self.done(Outcome::Unknown);
+        };
+        if payload.get("revision").and_then(Value::as_u64) != Some(revision) {
+            self.attempts += 1;
+            if self.attempts >= MAX_FAILURES {
+                return self.done(Outcome::Contended);
+            }
+            self.start_read();
+            return Progress::Waiting;
+        }
+        let observed = payload
+            .get("metadata")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<Metadata>(v).ok());
+        if payload.get("found").and_then(Value::as_bool) != Some(true)
+            || payload.get("count").and_then(Value::as_u64) != Some(WINDOW)
+            || observed.as_ref() != Some(&metadata)
+        {
+            return self.done(Outcome::Unknown);
+        }
+        let Some(value) = payload.get("value") else {
+            return self.done(Outcome::Unknown);
+        };
+        let Ok(oldest) = serde_json::from_value::<Receipt>(value.clone()) else {
+            return self.done(Outcome::Unknown);
+        };
+        if !valid_operation_id(&oldest.operation_id)
+            || validate_content(&oldest.request).is_err()
+            || !matches!(&oldest.state, ReceiptState::Completed { result } if validate_content(result).is_ok())
+        {
+            return self.done(Outcome::Unknown);
+        }
+        let Some(sequence) = self.operation.sequence() else {
+            return self.done(Outcome::Unknown);
+        };
+        if !matches!(self.operation, Operation::Begin { .. })
+            || metadata.pending != 0
+            || metadata.high.checked_add(1) != Some(sequence)
+        {
+            return self.done(Outcome::Unknown);
+        }
+        let Some(low) = metadata.low.checked_add(1) else {
+            return self.done(Outcome::Unknown);
+        };
+        let Some(next_revision) = revision.checked_add(1) else {
+            return self.done(Outcome::Unknown);
+        };
+        metadata.low = low;
+        metadata.high = sequence;
+        metadata.pending = 1;
+        let receipt = self.operation.receipt(ReceiptState::Pending);
+        self.write_revision = Some(next_revision);
+        self.write_outcome = Some(Outcome::Begun);
+        self.set_exchange(json!({"action":"collection_commit","collection":COLLECTION,"expected_revision":revision,"metadata":metadata,"edits":[{"key":format!("{low:020}"),"value":null},{"key":self.operation.key(),"value":receipt}]}), "write");
+        self.phase = Phase::Write;
+        Progress::Waiting
     }
 }
 fn receipt_outcome(receipt: Receipt) -> Outcome {
@@ -684,6 +755,44 @@ mod tests {
         assert_eq!(state.run(lookup("epoch-a", 100)), Outcome::Expired);
         assert_eq!(state.metadata["low"], 100);
         assert_eq!(state.metadata["high"], 100);
+    }
+    #[test]
+    fn full_window_automatically_retires_only_completed_receipts() {
+        let mut state = FakeState::default();
+        for sequence in 1..=100 {
+            assert_eq!(state.run(begin("epoch-a", sequence)), Outcome::Begun);
+            assert!(matches!(
+                state.run(complete("epoch-a", sequence)),
+                Outcome::Completed(_)
+            ));
+        }
+        assert_eq!(state.metadata["low"], 36);
+        assert_eq!(state.metadata["high"], 100);
+        assert_eq!(state.entries.len(), 64);
+        assert_eq!(state.run(lookup("epoch-a", 36)), Outcome::Expired);
+        assert!(matches!(
+            state.run(lookup("epoch-a", 37)),
+            Outcome::Completed(_)
+        ));
+        assert_eq!(state.run(begin("epoch-a", 1)), Outcome::Expired);
+    }
+    #[test]
+    fn oldest_pending_or_unreadable_record_is_never_retired() {
+        let mut state = FakeState::default();
+        for sequence in 1..=64 {
+            assert_eq!(state.run(begin("epoch-a", sequence)), Outcome::Begun);
+            assert!(matches!(
+                state.run(complete("epoch-a", sequence)),
+                Outcome::Completed(_)
+            ));
+        }
+        let key = format!("{:020}", 1);
+        state.entries.get_mut(&key).unwrap()["state"] = json!({"state":"pending"});
+        let prior_revision = state.revision;
+        assert_eq!(state.run(begin("epoch-a", 65)), Outcome::Unknown);
+        assert_eq!(state.revision, prior_revision);
+        assert!(state.entries.contains_key(&key));
+        assert!(!state.entries.contains_key(&format!("{:020}", 65)));
     }
     #[test]
     fn pending_blocks_new_sequence_retirement_and_changed_retry() {
