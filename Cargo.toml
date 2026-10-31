@@ -1,0 +1,13 @@
+[package]
+name = "amaterasu-display-settings"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+amaterasu-module-sdk = { path = "../amaterasu/crates/module-sdk" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
