@@ -40,6 +40,18 @@ enum PendingPhase {
         receipt: Box<crate::receipt_store::Receipt>,
         verification: Box<PendingVerification>,
     },
+    StatusBindingLoad {
+        request: Box<ProviderRequest>,
+        candidate: Box<extension_api::CaptureBinding>,
+        obligations: Vec<extension_api::ResourceObligation>,
+        store: Box<crate::durable_store::VirtualDurableStateStore>,
+    },
+    StatusBinding {
+        validator: Box<crate::virtual_callback::BindingValidator>,
+        store: Box<crate::durable_store::VirtualDurableStateStore>,
+        candidate: Box<extension_api::CaptureBinding>,
+        obligations: Vec<extension_api::ResourceObligation>,
+    },
     Verify {
         request: Box<ProviderRequest>,
         verification: Box<PendingVerification>,
@@ -264,11 +276,6 @@ fn dispatch(caller: &str, payload: &Value, now_ms: u64, remaining_ms: u64) -> Di
         }
         _ => Dispatch::Immediate(rejected("unknown_method")),
     }
-}
-// Effect dispatch remains disabled until the full runtime path is reviewed and
-// production coordinator admission and status recovery are available.
-fn effect_recovery_available() -> bool {
-    false
 }
 fn target_store_key(target: &LifecycleTarget) -> Result<String, &'static str> {
     let encoded = serde_json::to_vec(target).map_err(|_| "invalid_target")?;
@@ -530,9 +537,118 @@ fn advance_phase(
                 receipt,
                 verification,
             }),
-            Verification::Verified => Err(receipt_response(&request, &receipt)),
+            Verification::Verified => {
+                if let crate::receipt_store::ReceiptState::Completed { result } = &receipt.state
+                    && let Ok(crate::virtual_callback::CallbackResult::Prepared {
+                        candidate,
+                        obligations,
+                    }) = serde_json::from_value(result.clone())
+                {
+                    let admitted = admitted_obligations(&request)
+                        .map_err(|_| recovery("unowned_cleanup_obligation"))?;
+                    if obligations != admitted {
+                        return Err(recovery("receipt_obligation_mismatch"));
+                    }
+                    let epoch = crate::receipt_store::VerifiedEpoch::authenticate(
+                        target_epoch(&request.target).to_owned(),
+                        |_| true,
+                    )
+                    .map_err(|_| recovery("invalid_epoch"))?;
+                    let target = crate::durable_store::VerifiedTarget::authenticate(
+                        target_store_key(&request.target)
+                            .map_err(|_| recovery("invalid_target"))?,
+                        |_| true,
+                    )
+                    .map_err(|_| recovery("invalid_target"))?;
+                    let mut store = crate::durable_store::VirtualDurableStateStore::new(
+                        epoch,
+                        target,
+                        format!("statusbinding.{request_id}"),
+                        None,
+                        request.remaining_ms.min(30_000),
+                    )
+                    .map_err(|_| recovery("binding_store_unavailable"))?;
+                    store
+                        .start_load()
+                        .map_err(|_| recovery("binding_store_unavailable"))?;
+                    return Ok(PendingPhase::StatusBindingLoad {
+                        request,
+                        candidate,
+                        obligations,
+                        store: Box::new(store),
+                    });
+                }
+                Err(receipt_response(&request, &receipt))
+            }
             _ => Err(recovery("receipt_verification_unknown")),
         },
+        PendingPhase::StatusBindingLoad {
+            request,
+            candidate,
+            obligations,
+            mut store,
+        } => {
+            store.advance(now_ms, send);
+            let obligation = match store.poll_load() {
+                LoadProgress::Waiting => {
+                    return Ok(PendingPhase::StatusBindingLoad {
+                        request,
+                        candidate,
+                        obligations,
+                        store,
+                    });
+                }
+                LoadProgress::Found(obligation) => obligation,
+                _ => return Err(recovery("binding_obligation_unavailable")),
+            };
+            let Some(borrow) = obligation.borrow.as_ref() else {
+                return Err(recovery("binding_borrow_unavailable"));
+            };
+            let validation = crate::virtual_callback::BindingValidationRequest {
+                operation_id: format!("status.{}", request.provider_sequence),
+                transition_id: request.transition_id.clone(),
+                target: request.target.clone(),
+                plan_revision: candidate.plan_revision,
+                borrow_id: borrow.borrow_id.clone(),
+                binding: (*candidate).clone(),
+                observation: borrow.observed_output.clone(),
+            };
+            let validator = crate::virtual_callback::BindingValidator::new(
+                LIFECYCLE_CALLER,
+                validation,
+                obligation,
+                |_| true,
+                request.remaining_ms.min(30_000),
+                now_ms,
+            )
+            .map_err(|_| recovery("binding_validation_unavailable"))?;
+            Ok(PendingPhase::StatusBinding {
+                validator: Box::new(validator),
+                store,
+                candidate,
+                obligations,
+            })
+        }
+        PendingPhase::StatusBinding {
+            mut validator,
+            mut store,
+            candidate,
+            obligations,
+        } => {
+            store.advance(now_ms, send);
+            match validator.poll(now_ms, send, &mut *store) {
+                None => Ok(PendingPhase::StatusBinding {
+                    validator,
+                    store,
+                    candidate,
+                    obligations,
+                }),
+                Some(crate::virtual_callback::BindingValidationResult::Succeeded { .. }) => Err(
+                    json!({"status":"prepared","candidate":candidate,"obligations":obligations}),
+                ),
+                _ => Err(recovery("binding_revalidation_required")),
+            }
+        }
         PendingPhase::Verify {
             request,
             mut verification,
@@ -556,9 +672,6 @@ fn advance_phase(
                     return Ok(PendingPhase::Plan {
                         planner: Box::new(planner),
                     });
-                }
-                if !effect_recovery_available() {
-                    return Err(recovery("effect_path_not_qualified"));
                 }
                 if !matches!(
                     send(Command::CheckRequest {
@@ -944,6 +1057,231 @@ mod tests {
         })
         .collect();
         println!("APPROVALS_JSON={}", json!({"api_methods":approvals}));
+    }
+    fn callback_request() -> ProviderRequest {
+        serde_json::from_value(json!({"provider_sequence":1,"operation":"lifecycle_callback","version":1,"transition_id":"transition-1","operation_id":"virtual-1","target":{"kind":"stream","host_epoch":"epoch-1","session_id":"session-1","stream_id":"stream-1","generation":7},"phase":"stream.prepare","settings_revision":"settings-1","settings":{},"intent":"initial","reason":null,"requested_video":null,"consumer_requirements":{"execution_domain":"desktop","capture_providers":["amaterasu.capture-pipewire/1"],"selector_schemas":["amaterasu.kwin-wl-output/1"]},"remaining_ms":5000,"plan_revision":1,"admission_id":"admission-1","approved_plan":{"plan_id":"plan-1","revision":1,"resources":[{"provider":crate::descriptor::PROVIDER,"resource_id":"9c1d707f-7229-4fc4-b6e2-91f80c626a09","incarnation":null,"expected_revision":null,"execution_domain":"desktop","mutation_domains":["provider_session:abcdef"],"access":"exclusive"}],"mutation_domains":[{"domain":"provider_session:abcdef","expected_revision":1,"borrowers":{},"access":"exclusive"}],"required_capabilities":[],"constraints":{"virtual_display":{"provider_service":"amaterasu.virtual-display/1","identity":"9c1d707f-7229-4fc4-b6e2-91f80c626a09","reference_id":"stream-1","width":1920,"height":1080,"refresh_millihz":60000,"name":"Amaterasu","hdr_enabled":false,"scale":null,"layout":"extended","domain_id":"provider_session:abcdef","domain_revision":1,"geometry_revision":3,"borrow":null,"reference_released":false}},"obligations":[{"obligation_id":"cleanup-1","provider":"nonary.display-settings","resource_id":"9c1d707f-7229-4fc4-b6e2-91f80c626a09","mutation_domain":"provider_session:abcdef","depends_on":[],"cleanup_method":{"service":"nonary.display-settings/1","method":"lifecycle_callback","interface_major":1,"interface_minor":0,"schema_revision":1},"payload":{"service":"amaterasu.virtual-display/1","identity":"9c1d707f-7229-4fc4-b6e2-91f80c626a09","reference_id":"stream-1"}}],"affected_consumers":[],"consumer_change":"reconnect_required","candidate_constraint":{"capture_provider":"amaterasu.capture-pipewire/1","selector_schema":"amaterasu.kwin-wl-output/1","resource_provider":crate::descriptor::PROVIDER,"resource_id":"9c1d707f-7229-4fc4-b6e2-91f80c626a09","incarnation":null,"execution_domain":"desktop","mode":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false},"plan_revision":1},"allowed_degradation":[]}})).unwrap()
+    }
+    #[derive(Default)]
+    struct FakeBroker {
+        state_revision: u64,
+        values: std::collections::BTreeMap<String, Value>,
+        collection_revision: u64,
+        metadata: Value,
+        entries: std::collections::BTreeMap<String, Value>,
+        pending: std::collections::BTreeMap<u64, Value>,
+        next: u64,
+        effects: Vec<String>,
+        deny_after_checks: Option<usize>,
+        check_count: usize,
+        borrow_invalid: bool,
+    }
+    impl FakeBroker {
+        fn send(&mut self, command: Command) -> ModuleResult<Response> {
+            match command {
+                Command::CheckRequest { .. } => {
+                    self.check_count += 1;
+                    if self
+                        .deny_after_checks
+                        .is_some_and(|allowed| self.check_count > allowed)
+                    {
+                        Ok(Response::Error {
+                            code: "request_ended".into(),
+                            message: "expired".into(),
+                        })
+                    } else {
+                        Ok(Response::Ok)
+                    }
+                }
+                Command::Request {
+                    service, payload, ..
+                } => {
+                    let response = if service == "amaterasu.state/1" {
+                        match payload["action"].as_str().unwrap() {
+                            "get" => {
+                                let value = self.values.get(payload["key"].as_str().unwrap());
+                                json!({"ok":true,"revision":self.state_revision,"found":value.is_some(),"value":value})
+                            }
+                            "set" => {
+                                assert_eq!(
+                                    payload["expected_revision"].as_u64(),
+                                    Some(self.state_revision)
+                                );
+                                self.values.insert(
+                                    payload["key"].as_str().unwrap().into(),
+                                    payload["value"].clone(),
+                                );
+                                self.state_revision += 1;
+                                json!({"ok":true,"revision":self.state_revision})
+                            }
+                            "collection_get" => {
+                                json!({"ok":true,"revision":self.collection_revision,"found":self.collection_revision!=0,"metadata":self.metadata,"count":self.entries.len(),"value":self.entries.get(payload["key"].as_str().unwrap())})
+                            }
+                            "collection_commit" => {
+                                assert_eq!(
+                                    payload["expected_revision"].as_u64(),
+                                    Some(self.collection_revision)
+                                );
+                                for edit in payload["edits"].as_array().unwrap() {
+                                    let key = edit["key"].as_str().unwrap().to_owned();
+                                    if edit["value"].is_null() {
+                                        self.entries.remove(&key);
+                                    } else {
+                                        self.entries.insert(key, edit["value"].clone());
+                                    }
+                                }
+                                self.metadata = payload["metadata"].clone();
+                                self.collection_revision += 1;
+                                json!({"ok":true,"revision":self.collection_revision})
+                            }
+                            _ => panic!("unexpected state operation"),
+                        }
+                    } else if service == "amaterasu.session-lifecycle/1" {
+                        let mut answer = payload;
+                        answer["status"] = "succeeded".into();
+                        answer
+                    } else if service == "amaterasu.virtual-display/1" {
+                        let action = payload["action"].as_str().unwrap();
+                        self.effects.push(action.into());
+                        let domain = json!({"id":"provider_session:abcdef","revision":2,"borrowers":1,"pending_mutations":0,"scope":"provider_session"});
+                        match action {
+                            "create" => {
+                                assert!(self.metadata["pending"] == 1);
+                                assert!(self.values.values().any(|value| value["identity"]
+                                    == "9c1d707f-7229-4fc4-b6e2-91f80c626a09"));
+                                json!({"ok":true,"reference_owned":true,"monitor":{"specification":{"identity":"9c1d707f-7229-4fc4-b6e2-91f80c626a09","width":1920,"height":1080,"refresh_millihz":60000,"name":"Amaterasu","hdr_enabled":false},"virtual_display_layout":"extended","dd_virtual_display_scale":0,"state":"ready","error":null,"ready":{"device_path":"Virtual-1","active":true},"capture_output":"kwin:Virtual-1"}})
+                            }
+                            "validate_borrow" if self.borrow_invalid => {
+                                json!({"ok":false,"code":"borrow_invalid"})
+                            }
+                            "borrow" | "validate_borrow" => {
+                                json!({"ok":true,"borrow_id":"a".repeat(64),"observed_output":{"version":1,"protocol":"wayland-wl-output","compositor_id":"b".repeat(64),"registry_global":4,"output_name":"Virtual-1","width":1920,"height":1080,"refresh_millihz":60000},"mutation_domain":domain})
+                            }
+                            "release_borrow" => {
+                                json!({"ok":true,"released":true,"mutation_domain":domain})
+                            }
+                            "remove" => {
+                                json!({"ok":true,"removed":true,"identity":"9c1d707f-7229-4fc4-b6e2-91f80c626a09"})
+                            }
+                            _ => panic!("unexpected provider operation"),
+                        }
+                    } else {
+                        panic!("unexpected service {service}")
+                    };
+                    self.next += 1;
+                    self.pending.insert(self.next, response);
+                    Ok(Response::Accepted { id: self.next })
+                }
+                Command::TakeResult { request } => Ok(Response::Result {
+                    payload: self.pending.get(&request).unwrap().clone(),
+                }),
+                Command::ReleaseResult { request } => {
+                    self.pending.remove(&request);
+                    Ok(Response::Ok)
+                }
+                _ => panic!("unexpected broker command"),
+            }
+        }
+        fn status(&mut self, sequence: u64, operation_id: &str) -> Value {
+            let status = ProviderStatusRequest {
+                provider_sequence: sequence,
+                operation_id: operation_id.into(),
+                transition_id: "transition-1".into(),
+                receipt_id: operation_id.into(),
+            };
+            let lookup = crate::durable_store::PriorReceiptLookup::new(
+                LIFECYCLE_CALLER,
+                sequence,
+                operation_id.into(),
+                format!("status.{sequence}"),
+                None,
+                5000,
+                0,
+            )
+            .unwrap();
+            let mut phase = PendingPhase::StatusLookup {
+                status: Box::new(status),
+                lookup: Box::new(lookup),
+            };
+            for tick in 1..200 {
+                match advance_phase(phase, 77, tick, &mut |cmd| self.send(cmd)) {
+                    Ok(next) => phase = next,
+                    Err(result) => return result,
+                }
+            }
+            panic!("status did not settle")
+        }
+        fn drive_effect(&mut self, request: ProviderRequest) -> Value {
+            let verify = PendingVerification::from_request(LIFECYCLE_CALLER, &request, 0).unwrap();
+            let mut phase = PendingPhase::Verify {
+                request: Box::new(request),
+                verification: Box::new(verify),
+            };
+            for tick in 4..200 {
+                match advance_phase(phase, 77, tick, &mut |cmd| self.send(cmd)) {
+                    Ok(next) => phase = next,
+                    Err(result) => return result,
+                }
+            }
+            panic!("effect did not settle")
+        }
+    }
+    #[test]
+    fn verified_virtual_prepare_and_release_persist_before_native_effects() {
+        let mut broker = FakeBroker::default();
+        let mut prepare = callback_request();
+        let response = broker.drive_effect(prepare.clone());
+        assert_eq!(response["status"], "prepared");
+        assert_eq!(
+            response["candidate"]["resource"]["incarnation"],
+            "a".repeat(64)
+        );
+        assert_eq!(broker.effects, ["create", "borrow", "validate_borrow"]);
+        let status = broker.status(1, "virtual-1");
+        assert_eq!(status["status"], "prepared");
+        assert_eq!(status["candidate"], response["candidate"]);
+        assert_eq!(
+            broker.effects,
+            ["create", "borrow", "validate_borrow", "validate_borrow"]
+        );
+        broker.borrow_invalid = true;
+        assert_eq!(broker.status(1, "virtual-1")["status"], "recovery_required");
+        broker.borrow_invalid = false;
+        prepare.provider_sequence = 2;
+        prepare.operation_id = "virtual-2".into();
+        prepare.phase = LifecyclePhase::StreamRelease;
+        prepare.reason = Some(extension_api::ReleaseReason::Pause);
+        let response = broker.drive_effect(prepare);
+        assert_eq!(response["status"], "cleanup");
+        assert_eq!(response["outcomes"][0]["state"], "released");
+        assert_eq!(
+            broker.effects,
+            [
+                "create",
+                "borrow",
+                "validate_borrow",
+                "validate_borrow",
+                "validate_borrow",
+                "release_borrow",
+                "remove"
+            ]
+        );
+        assert!(
+            broker
+                .values
+                .values()
+                .any(|value| value["reference_released"] == true && value["borrow"].is_null())
+        );
+    }
+    #[test]
+    fn expired_callback_after_durable_reservation_never_creates_display() {
+        let mut broker = FakeBroker {
+            deny_after_checks: Some(1),
+            ..Default::default()
+        };
+        let response = broker.drive_effect(callback_request());
+        assert_eq!(response["status"], "recovery_required");
+        assert!(broker.effects.is_empty());
+        assert_eq!(broker.metadata["pending"], 1);
     }
     #[test]
     fn target_key_preserves_full_uuid_identity_and_generation() {
