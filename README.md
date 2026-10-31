@@ -39,10 +39,14 @@ checkout of this repository is not sufficient to build it today.
 No local build or unit test modifies displays. Tests do not establish that native
 mode setting, recovery, capture binding, or either platform works on hardware.
 
-Simulated coordinator and fake-provider tests exercise parts of the composition;
-they do not establish real native mode setting, recovery, capture binding or
-streaming. Linux and Windows integration and hardware qualification remain
-outstanding.
+A test using the real broker, state service, lifecycle coordinator and both
+extensions completed ten streams with alternating modes, active and paused
+session endings, and a second session using the same native domain. The native
+display and capture backends were simulated. The first two keyboard-triggered
+removals also completed; further action lifecycle testing remains in progress.
+These results do not establish native mode setting, capture, streaming or
+hardware behavior. The virtual-screen owner currently supports Linux; its
+Windows startup is fenced, and Windows qualification remains outstanding.
 
 `examples/component-linux.json` is a component-manifest template; the packager
 replaces its hash and size. `examples/lifecycle-api-approvals.json` shows the

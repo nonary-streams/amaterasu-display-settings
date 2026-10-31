@@ -16,9 +16,14 @@ preserved. HDR streams or active HDR, overrides, scale changes and highest-mode
 enumeration are rejected. Virtual layouts are limited to preserve, exclusive and
 extended; physical layout changes are rejected, and no compatible v2 physical
 producer is available. Restored handoffs require a matching snapshot-bound
-preservation proof. Some multi-session cases, native mode and capture behavior,
-and complete streaming remain unqualified on Linux and Windows. Tests using fake
-providers do not establish hardware or deployment behavior.
+preservation proof. A test with the real broker, state service, lifecycle
+coordinator and both extensions completed ten alternating-mode streams, active
+and paused session endings, and a second session using the same native domain.
+The first two keyboard-triggered removals completed; further action lifecycle
+testing remains in progress. Native display and capture were simulated, so this
+evidence does not qualify hardware, capture or streaming. Some multi-session
+cases remain unqualified. The virtual-screen owner currently supports Linux and
+fences Windows startup; Windows qualification remains outstanding.
 
 Revision-1 combined settings and old caller-owned resources require explicit
 export, review and retirement under the old owner before a fresh profile is
