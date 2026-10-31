@@ -1366,6 +1366,7 @@ mod tests {
             .unwrap()
             .clone();
         obligation["identity"] = json!("6f410583-4b76-5ba6-bf99-0745617106eb");
+        obligation["reference_id"] = json!("ref-dbfc1a77bc181a02b199997ec5e877fc");
         let session = LifecycleTarget::Session {
             host_epoch: "epoch-1".into(),
             session_id: "session-1".into(),

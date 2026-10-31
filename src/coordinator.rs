@@ -34,6 +34,8 @@ pub struct PendingVerification {
     failures: u8,
     uncertain: bool,
     done: Option<Verification>,
+    session_target: Option<LifecycleTarget>,
+    consumers_retired: Option<bool>,
 }
 impl PendingVerification {
     pub fn from_request(
@@ -109,7 +111,23 @@ impl PendingVerification {
             failures: 0,
             uncertain: false,
             done: None,
+            session_target: None,
+            consumers_retired: None,
         })
+    }
+    /// Canonical parent supplied by the authenticated coordinator after verification.
+    pub fn session_target(&self) -> Option<&LifecycleTarget> {
+        (self.done == Some(Verification::Verified))
+            .then_some(self.session_target.as_ref())
+            .flatten()
+    }
+    /// Coordinator-observed retirement of all older consumers, if supplied.
+    pub fn consumers_retired(&self) -> Option<bool> {
+        if self.done == Some(Verification::Verified) {
+            self.consumers_retired
+        } else {
+            None
+        }
     }
     pub fn poll(
         &mut self,
@@ -139,11 +157,18 @@ impl PendingVerification {
                             && reply.get("fingerprint").and_then(Value::as_str)
                                 == Some(self.identity.fingerprint.as_str())
                             && reply.get("target") == Some(&self.identity.target);
-                        self.finish(if verified {
-                            Verification::Verified
+                        let selected = parse_session_target(
+                            &self.identity.target,
+                            reply.get("session_target"),
+                        );
+                        if verified && selected.is_some() {
+                            self.session_target = selected.flatten();
+                            self.consumers_retired =
+                                reply.get("consumers_retired").and_then(Value::as_bool);
+                            self.finish(Verification::Verified)
                         } else {
-                            Verification::Rejected
-                        })
+                            self.finish(Verification::Rejected)
+                        }
                     }
                     _ => {
                         self.reply = Some(reply);
@@ -186,6 +211,52 @@ impl PendingVerification {
     }
 }
 
+// None denotes invalid; Some(None) denotes a sessionless validation scope.
+fn parse_session_target(target: &Value, parent: Option<&Value>) -> Option<Option<LifecycleTarget>> {
+    let target: LifecycleTarget = serde_json::from_value(target.clone()).ok()?;
+    match target {
+        LifecycleTarget::Validation { .. } => Some(None),
+        LifecycleTarget::Session {
+            ref host_epoch,
+            ref session_id,
+            generation,
+        } => {
+            let parent: LifecycleTarget = serde_json::from_value(parent?.clone()).ok()?;
+            match &parent {
+                LifecycleTarget::Session {
+                    host_epoch: epoch,
+                    session_id: id,
+                    generation: actual,
+                } if epoch == host_epoch
+                    && id == session_id
+                    && *actual == generation
+                    && *actual != 0 =>
+                {
+                    Some(Some(parent))
+                }
+                _ => None,
+            }
+        }
+        LifecycleTarget::Stream {
+            ref host_epoch,
+            ref session_id,
+            ..
+        } => {
+            let parent: LifecycleTarget = serde_json::from_value(parent?.clone()).ok()?;
+            match &parent {
+                LifecycleTarget::Session {
+                    host_epoch: epoch,
+                    session_id: id,
+                    generation,
+                } if epoch == host_epoch && id == session_id && *generation != 0 => {
+                    Some(Some(parent))
+                }
+                _ => None,
+            }
+        }
+    }
+}
+
 fn valid_id(value: &str, max: usize) -> bool {
     !value.is_empty()
         && value.len() <= max
@@ -215,7 +286,7 @@ mod tests {
             let mut replies = VecDeque::from([
                 Response::Accepted { id: 7 },
                 Response::Result {
-                    payload: json!({"status":"succeeded","host_epoch":"host-1","provider_sequence":if mismatch { 8 } else { 9 },"operation_id":"op-9","transition_id":"transition-9","fingerprint":"a".repeat(64),"target":{"kind":"session","host_epoch":"host-1","session_id":"s","generation":1}}),
+                    payload: json!({"status":"succeeded","host_epoch":"host-1","provider_sequence":if mismatch { 8 } else { 9 },"operation_id":"op-9","transition_id":"transition-9","fingerprint":"a".repeat(64),"target":{"kind":"session","host_epoch":"host-1","session_id":"s","generation":1},"session_target":{"kind":"session","host_epoch":"host-1","session_id":"s","generation":1}}),
                 },
                 Response::Ok,
             ]);
@@ -258,5 +329,16 @@ mod tests {
             panic!("unexpected command")
         };
         assert_ne!(a, b);
+    }
+    #[test]
+    fn canonical_parent_must_match_selected_session_and_epoch() {
+        let stream = json!({"kind":"stream","host_epoch":"host-1","session_id":"session-a","stream_id":"stream","generation":4});
+        let parent =
+            json!({"kind":"session","host_epoch":"host-1","session_id":"session-a","generation":2});
+        assert!(parse_session_target(&stream, Some(&parent)).is_some());
+        let wrong =
+            json!({"kind":"session","host_epoch":"host-1","session_id":"session-b","generation":2});
+        assert!(parse_session_target(&stream, Some(&wrong)).is_none());
+        assert!(parse_session_target(&stream, None).is_none());
     }
 }

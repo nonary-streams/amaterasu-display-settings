@@ -37,6 +37,35 @@ pub struct Planner {
     finished: Option<PlanProgress>,
     parent: Option<u64>,
     physical_domain: Option<(String, u64)>,
+    session: Option<VerifiedSessionDisplay>,
+}
+
+/// Exact session-scoped obligation loaded from the authenticated provider
+/// journal. The verifier must bind this target to the coordinator's stream.
+pub struct VerifiedSessionDisplay {
+    pub target: LifecycleTarget,
+    pub obligation: VirtualObligation,
+    observed_revision: Option<u64>,
+}
+impl VerifiedSessionDisplay {
+    pub fn authenticate(
+        target: LifecycleTarget,
+        obligation: VirtualObligation,
+        verify: impl FnOnce(&LifecycleTarget, &VirtualObligation) -> bool,
+    ) -> Result<Self, &'static str> {
+        if !matches!(target, LifecycleTarget::Session { .. })
+            || obligation.reference_released
+            || obligation.borrow.is_none()
+            || !verify(&target, &obligation)
+        {
+            return Err("session_ownership_unverified");
+        }
+        Ok(Self {
+            target,
+            obligation,
+            observed_revision: None,
+        })
+    }
 }
 enum Selection {
     Virtual {
@@ -50,6 +79,7 @@ enum Selection {
 #[derive(Clone, Copy)]
 enum Stage {
     VirtualStatus,
+    ValidateSessionBorrow,
     PhysicalStatus,
     PhysicalSnapshot,
 }
@@ -178,7 +208,66 @@ impl Planner {
             finished: None,
             parent,
             physical_domain: None,
+            session: None,
         })
+    }
+    /// Attach only a coordinator-bound journal record before the first poll.
+    /// This validates its native borrow before observing the new reference.
+    pub fn attach_session(
+        &mut self,
+        session: VerifiedSessionDisplay,
+        now_ms: u64,
+    ) -> Result<(), &'static str> {
+        if !matches!(self.stage, Stage::VirtualStatus)
+            || self.exchange.id.is_some()
+            || self.exchange.result.is_some()
+            || self.exchange.uncertain
+        {
+            return Err("planning_already_started");
+        }
+        let (stream_epoch, stream_session) = match &self.request.target {
+            LifecycleTarget::Stream {
+                host_epoch,
+                session_id,
+                ..
+            } => (host_epoch, session_id),
+            _ => return Err("not_stream_target"),
+        };
+        let (session_epoch, session_id) = match &session.target {
+            LifecycleTarget::Session {
+                host_epoch,
+                session_id,
+                ..
+            } => (host_epoch, session_id),
+            _ => return Err("invalid_session_target"),
+        };
+        let Selection::Virtual { identity, .. } = &self.selection else {
+            return Err("invalid_selection");
+        };
+        let old = &session.obligation;
+        let (_, session_reference) = target_ids(&session.target)?;
+        let expected_reference = format!("ref-{}", stable_hex("reference", &session_reference));
+        if stream_epoch != session_epoch
+            || stream_session != session_id
+            || old.identity != *identity
+            || old.provider_service != virtual_display::SERVICE
+            || old.reference_id != expected_reference
+        {
+            return Err("session_ownership_mismatch");
+        }
+        let borrow = old.borrow.as_ref().ok_or("missing_session_borrow")?;
+        let payload = json!({"action":"validate_borrow","identity":old.identity,"reference_id":old.reference_id,"borrow_id":borrow.borrow_id});
+        self.exchange = make_exchange(
+            virtual_display::SERVICE,
+            payload,
+            &self.request,
+            "validate-session",
+            self.parent,
+            self.deadline_ms.saturating_sub(now_ms),
+        )?;
+        self.session = Some(session);
+        self.stage = Stage::ValidateSessionBorrow;
+        Ok(())
     }
     /// Polls at most one broker command. Transport acceptance does not imply
     /// provider readiness or permission to execute a plan.
@@ -238,6 +327,67 @@ impl Planner {
     }
     fn consume(&mut self, payload: Value, now_ms: u64) -> PlanProgress {
         match self.stage {
+            Stage::ValidateSessionBorrow => {
+                let Some(session) = self.session.as_mut() else {
+                    return self.finish(rejected("session_ownership_unverified"));
+                };
+                let Some(saved) = session.obligation.borrow.as_ref() else {
+                    return self.finish(rejected("session_ownership_unverified"));
+                };
+                let observed: Option<virtual_display::DisplayBorrow> = (|| {
+                    Some(virtual_display::DisplayBorrow {
+                        borrow_id: payload.get("borrow_id")?.as_str()?.to_owned(),
+                        observed_output: serde_json::from_value(
+                            payload.get("observed_output")?.clone(),
+                        )
+                        .ok()?,
+                        mutation_domain: serde_json::from_value(
+                            payload.get("mutation_domain")?.clone(),
+                        )
+                        .ok()?,
+                    })
+                })();
+                let Some(current) = observed else {
+                    return self.finish(rejected("session_borrow_unverified"));
+                };
+                if payload.get("ok").and_then(Value::as_bool) != Some(true)
+                    || current.borrow_id != saved.borrow_id
+                    || current.observed_output != saved.observed_output
+                    || current.mutation_domain.id != saved.mutation_domain.id
+                    || current.mutation_domain.revision < saved.mutation_domain.revision
+                    || current.mutation_domain.borrowers != 1
+                    || current.mutation_domain.pending_mutations != 0
+                    || current.mutation_domain.scope != "provider_session"
+                {
+                    return self.finish(rejected("session_borrow_unverified"));
+                }
+                session.observed_revision = Some(current.mutation_domain.revision);
+                let Selection::Virtual {
+                    identity,
+                    reference_id,
+                    ..
+                } = &self.selection
+                else {
+                    return self.finish(rejected("invalid_selection"));
+                };
+                let payload =
+                    json!({"action":"status","identity":identity,"reference_id":reference_id});
+                match make_exchange(
+                    virtual_display::SERVICE,
+                    payload,
+                    &self.request,
+                    "status",
+                    self.parent,
+                    self.deadline_ms.saturating_sub(now_ms),
+                ) {
+                    Ok(exchange) => {
+                        self.exchange = exchange;
+                        self.stage = Stage::VirtualStatus;
+                        PlanProgress::Waiting
+                    }
+                    Err(_) => self.finish(rejected("provider_unavailable")),
+                }
+            }
             Stage::VirtualStatus => match self.virtual_plan(&payload) {
                 Ok(plan) => self.finish(PlanProgress::Complete(Box::new(
                     ProviderResponse::Planned { plan },
@@ -474,12 +624,53 @@ impl Planner {
         {
             return Err("virtual_provider_unavailable");
         }
-        if payload.get("reference_owned").and_then(Value::as_bool) != Some(false)
-            || payload
-                .get("monitors")
-                .and_then(Value::as_array)
-                .is_none_or(|v| !v.is_empty())
-        {
+        if payload.get("reference_owned").and_then(Value::as_bool) != Some(false) {
+            return Err("existing_virtual_reference_requires_reconciliation");
+        }
+        let monitors = payload
+            .get("monitors")
+            .and_then(Value::as_array)
+            .ok_or("invalid_monitor_status")?;
+        if let Some(session) = &self.session {
+            let old = &session.obligation;
+            if old.width != mode.width
+                || old.height != mode.height
+                || old.refresh_millihz != mode.refresh_millihz
+                || old.hdr_enabled != mode.hdr
+            {
+                return Err("mode_change_requires_retirement");
+            }
+            let [monitor] = monitors.as_slice() else {
+                return Err("session_monitor_unverified");
+            };
+            let spec = monitor
+                .get("specification")
+                .ok_or("session_monitor_unverified")?;
+            let saved = old.borrow.as_ref().ok_or("session_borrow_unverified")?;
+            if spec.get("identity").and_then(Value::as_str) != Some(identity)
+                || spec.get("width").and_then(Value::as_u64) != Some(u64::from(old.width))
+                || spec.get("height").and_then(Value::as_u64) != Some(u64::from(old.height))
+                || spec.get("refresh_millihz").and_then(Value::as_u64)
+                    != Some(u64::from(old.refresh_millihz))
+                || spec.get("name").and_then(Value::as_str) != Some(old.name.as_str())
+                || spec.get("hdr_enabled").and_then(Value::as_bool) != Some(old.hdr_enabled)
+                || monitor.get("reference_owned").and_then(Value::as_bool) != Some(false)
+                || monitor.get("state").and_then(Value::as_str) != Some("ready")
+                || monitor
+                    .get("virtual_display_layout")
+                    .and_then(Value::as_str)
+                    != Some(old.layout.as_str())
+                || monitor
+                    .get("dd_virtual_display_scale")
+                    .and_then(Value::as_i64)
+                    != old.scale.map(i64::from)
+                || monitor.get("capture_output").and_then(Value::as_str)
+                    != Some(format!("kwin:{}", saved.observed_output.output_name).as_str())
+                || monitor.pointer("/ready/active").and_then(Value::as_bool) != Some(true)
+            {
+                return Err("session_monitor_unverified");
+            }
+        } else if !monitors.is_empty() {
             return Err("existing_virtual_reference_requires_reconciliation");
         }
         let domain = payload
@@ -499,8 +690,9 @@ impl Planner {
             .get("revision")
             .and_then(Value::as_u64)
             .ok_or("invalid_mutation_domain")?;
+        let expected_borrowers = if self.session.is_some() { 1 } else { 0 };
         if domain.get("scope").and_then(Value::as_str) != Some("provider_session")
-            || domain.get("borrowers").and_then(Value::as_u64) != Some(0)
+            || domain.get("borrowers").and_then(Value::as_u64) != Some(expected_borrowers)
             || domain.get("pending_mutations").and_then(Value::as_u64) != Some(0)
         {
             return Err("mutation_domain_busy");
@@ -525,6 +717,13 @@ impl Planner {
         };
         if !matches!(layout, "exclusive" | "extended") {
             return Err("layout_unsupported");
+        }
+        if let Some(session) = &self.session
+            && (session.obligation.layout != layout
+                || session.obligation.domain_id != id
+                || session.observed_revision != Some(revision))
+        {
+            return Err("session_domain_changed");
         }
         let plan_revision = self.request.provider_sequence;
         let selection = VirtualObligation {
@@ -578,6 +777,18 @@ impl Planner {
             },
             payload: json!({"service":virtual_display::SERVICE,"identity":identity,"reference_id":reference_id}),
         };
+        let borrowers = if let Some(session) = &self.session {
+            match &session.target {
+                LifecycleTarget::Session {
+                    session_id,
+                    generation,
+                    ..
+                } => BTreeMap::from([(session_id.clone(), *generation)]),
+                _ => return Err("invalid_session_target"),
+            }
+        } else {
+            BTreeMap::new()
+        };
         let plan = ResourcePlan {
             plan_id: format!(
                 "display-plan-{}",
@@ -588,7 +799,7 @@ impl Planner {
             mutation_domains: vec![MutationDomainPlan {
                 domain: id.into(),
                 expected_revision: revision,
-                borrowers: BTreeMap::new(),
+                borrowers,
                 access: ResourceAccess::Exclusive,
             }],
             required_capabilities: vec![],
@@ -806,6 +1017,78 @@ mod tests {
         );
         assert!(
             matches!(&commands[..],[Command::Request {service,payload,..},Command::TakeResult {..},Command::ReleaseResult {..}] if service==virtual_display::SERVICE && payload["action"]=="status")
+        );
+    }
+    #[test]
+    fn stream_reuses_only_verified_session_reference_and_matching_live_output() {
+        let mut planner = Planner::new(COORDINATOR, request(), Some(2), 0, |_| true).unwrap();
+        let Selection::Virtual { identity, .. } = &planner.selection else {
+            panic!()
+        };
+        let identity = identity.clone();
+        let target:LifecycleTarget=serde_json::from_value(json!({"kind":"session","host_epoch":"epoch-1","session_id":"session-1","generation":1})).unwrap();
+        let session_ref = format!(
+            "ref-{}",
+            stable_hex("reference", &target_ids(&target).unwrap().1)
+        );
+        let observation = json!({"version":1,"protocol":"wayland-wl-output","compositor_id":"b".repeat(64),"registry_global":4,"output_name":"Virtual-1","width":1920,"height":1080,"refresh_millihz":60000});
+        let domain = json!({"id":"provider_session:abc","revision":7,"borrowers":1,"pending_mutations":0,"scope":"provider_session"});
+        let borrow = json!({"borrow_id":"a".repeat(64),"observed_output":observation,"mutation_domain":domain});
+        let obligation:VirtualObligation=serde_json::from_value(json!({"provider_service":virtual_display::SERVICE,"identity":identity,"reference_id":session_ref,"width":1920,"height":1080,"refresh_millihz":60000,"name":"Amaterasu","hdr_enabled":false,"scale":0,"layout":"extended","domain_id":"provider_session:abc","domain_revision":6,"geometry_revision":1,"borrow":borrow,"reference_released":false})).unwrap();
+        let session =
+            VerifiedSessionDisplay::authenticate(target, obligation, |_, _| true).unwrap();
+        planner.attach_session(session, 0).unwrap();
+        let mut provider_status = status();
+        provider_status["mutation_domain"] = domain.clone();
+        provider_status["monitors"] = json!([{"reference_owned":false,"specification":{"identity":identity,"width":1920,"height":1080,"refresh_millihz":60000,"name":"Amaterasu","hdr_enabled":false},"state":"ready","virtual_display_layout":"extended","dd_virtual_display_scale":0,"capture_output":"kwin:Virtual-1","ready":{"active":true}}]);
+        let mut live = borrow.clone();
+        live["ok"] = json!(true);
+        let mut replies = VecDeque::from([
+            Ok(Response::Accepted { id: 1 }),
+            Ok(Response::Result { payload: live }),
+            Ok(Response::Ok),
+            Ok(Response::Accepted { id: 2 }),
+            Ok(Response::Result {
+                payload: provider_status.clone(),
+            }),
+            Ok(Response::Ok),
+        ]);
+        let mut result = PlanProgress::Waiting;
+        for tick in 0..6 {
+            result = planner.poll(tick, &mut |_| replies.pop_front().unwrap());
+        }
+        let PlanProgress::Complete(response) = result else {
+            panic!("{result:?}")
+        };
+        let ProviderResponse::Planned { plan } = *response else {
+            panic!("expected plan")
+        };
+        assert_eq!(
+            plan.mutation_domains[0].borrowers.get("session-1"),
+            Some(&1)
+        );
+        assert_eq!(plan.mutation_domains[0].expected_revision, 7);
+        assert_ne!(
+            plan.constraints["virtual_display"]["reference_id"],
+            json!(session_ref)
+        );
+        let mut foreign = provider_status.clone();
+        foreign["monitors"][0]["specification"]["identity"] = json!("other");
+        assert_eq!(
+            planner.virtual_plan(&foreign).unwrap_err(),
+            "session_monitor_unverified"
+        );
+        let mut busy = provider_status.clone();
+        busy["mutation_domain"]["borrowers"] = json!(2);
+        assert_eq!(
+            planner.virtual_plan(&busy).unwrap_err(),
+            "mutation_domain_busy"
+        );
+        let mut drift = provider_status;
+        drift["mutation_domain"]["revision"] = json!(8);
+        assert_eq!(
+            planner.virtual_plan(&drift).unwrap_err(),
+            "session_domain_changed"
         );
     }
     #[test]
