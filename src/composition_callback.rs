@@ -162,6 +162,7 @@ pub fn composition_callback(request: &ProviderRequest) -> Result<ProviderRespons
                     reason: None,
                 })
                 .collect(),
+            outputs: vec![],
         }
     };
     extension_api::validate_provider_response(request, &response)
