@@ -3,8 +3,8 @@
 //! A proposed plan does not authorize native effects. The coordinator must
 //! admit it and recheck revisions before dispatching a lifecycle callback.
 use crate::settings::{
-    DisplaySettings, HdrOverrideSetting, LayoutSetting, PhysicalTargetSetting, RefreshSetting,
-    ResolutionSetting, RetentionSetting, ScalingSetting,
+    DisplaySettings, HdrOverrideSetting, HdrSetting, LayoutSetting, PhysicalTargetSetting,
+    RefreshSetting, ResolutionSetting, RetentionSetting, ScalingSetting,
 };
 use crate::virtual_callback::VirtualObligation;
 use crate::{descriptor, physical_display, virtual_display};
@@ -36,6 +36,7 @@ pub struct Planner {
     failures: u8,
     finished: Option<PlanProgress>,
     parent: Option<u64>,
+    physical_domain: Option<(String, u64)>,
 }
 enum Selection {
     Virtual {
@@ -176,6 +177,7 @@ impl Planner {
             failures: 0,
             finished: None,
             parent,
+            physical_domain: None,
         })
     }
     /// Polls at most one broker command. Transport acceptance does not imply
@@ -250,6 +252,29 @@ impl Planner {
                 {
                     return self.finish(rejected("physical_provider_unavailable"));
                 }
+                let Some(domain) = payload.get("mutation_domain") else {
+                    return self.finish(rejected("physical_domain_unavailable"));
+                };
+                let Some(id) = domain.get("id").and_then(Value::as_str).filter(|v| {
+                    v.starts_with("physical_provider_session:")
+                        && v.len() <= 128
+                        && v.bytes().all(|b| b.is_ascii_graphic())
+                }) else {
+                    return self.finish(rejected("physical_domain_unavailable"));
+                };
+                let Some(revision) = domain.get("revision").and_then(Value::as_u64) else {
+                    return self.finish(rejected("physical_domain_unavailable"));
+                };
+                if domain.get("scope").and_then(Value::as_str) != Some("provider_lease_only")
+                    || domain.get("active_leases").and_then(Value::as_u64) != Some(0)
+                    || domain
+                        .get("external_borrowers_known")
+                        .and_then(Value::as_bool)
+                        != Some(false)
+                {
+                    return self.finish(rejected("physical_domain_busy_or_unknown"));
+                }
+                self.physical_domain = Some((id.to_owned(), revision));
                 let remaining = self.deadline_ms.saturating_sub(now_ms).min(30_000);
                 match make_exchange(
                     physical_display::SERVICE,
@@ -285,22 +310,150 @@ impl Planner {
                 {
                     return self.finish(rejected("physical_snapshot_unavailable"));
                 }
-                let Ok(settings) = serde_json::from_value::<DisplaySettings>(
-                    serde_json::to_value(&self.request.settings).expect("settings serialize"),
-                ) else {
-                    return self.finish(rejected("invalid_settings"));
-                };
-                if let Err(reason) =
-                    select_physical(snapshot.as_ref().expect("validated snapshot"), &settings)
-                {
-                    return self.finish(rejected(reason));
+                match self.physical_plan(
+                    snapshot.expect("validated snapshot"),
+                    revision.expect("validated revision"),
+                ) {
+                    Ok(plan) => self.finish(PlanProgress::Complete(Box::new(
+                        ProviderResponse::Planned { plan },
+                    ))),
+                    Err(reason) => self.finish(rejected(reason)),
                 }
-                // The service has no public mutation-domain borrower identities
-                // or monotonic domain revision. A snapshot hash cannot be used
-                // as that authority without collisions or invented semantics.
-                self.finish(rejected("physical_domain_authority_unavailable"))
             }
         }
+    }
+    fn physical_plan(
+        &self,
+        mut configuration: physical_display::Configuration,
+        topology_revision: &str,
+    ) -> Result<ResourcePlan, &'static str> {
+        let settings: DisplaySettings = serde_json::from_value(
+            serde_json::to_value(&self.request.settings).map_err(|_| "invalid_settings")?,
+        )
+        .map_err(|_| "invalid_settings")?;
+        if settings.scaling != ScalingSetting::Preserve
+            || settings.layout != LayoutSetting::Preserve
+            || settings.hdr != HdrSetting::Preserve
+            || settings.hdr_request_override != HdrOverrideSetting::FollowClient
+            || settings.retention != RetentionSetting::UntilSessionEnds
+            || settings.keepalive_while_paused
+            || settings.enforce_while_paused
+        {
+            return Err("unsupported_physical_policy");
+        }
+        // HDR preserve means no independent HDR state operation, even when
+        // the discovery snapshot can read the current advanced-color bit.
+        for display in &mut configuration.displays {
+            display.hdr_enabled = None;
+        }
+        let selected_id = select_physical(&configuration, &settings)?.id.clone();
+        let selected = configuration
+            .displays
+            .iter_mut()
+            .find(|display| display.id == selected_id)
+            .ok_or("physical_target_unavailable")?;
+        match settings.resolution {
+            ResolutionSetting::Preserve => {}
+            ResolutionSetting::Manual => {
+                selected.width = settings.width;
+                selected.height = settings.height;
+            }
+            ResolutionSetting::Client => {
+                let mode = self
+                    .request
+                    .requested_video
+                    .as_ref()
+                    .ok_or("missing_requested_video")?;
+                selected.width = mode.width;
+                selected.height = mode.height;
+            }
+        }
+        match settings.refresh {
+            RefreshSetting::Preserve => {}
+            RefreshSetting::Manual => {
+                selected.refresh = physical_display::Rational {
+                    numerator: settings.refresh_numerator,
+                    denominator: settings.refresh_denominator,
+                }
+            }
+            RefreshSetting::Client => {
+                let mode = self
+                    .request
+                    .requested_video
+                    .as_ref()
+                    .ok_or("missing_requested_video")?;
+                selected.refresh = physical_display::Rational {
+                    numerator: mode.refresh_millihz,
+                    denominator: 1000,
+                };
+            }
+            RefreshSetting::HighestAvailable => return Err("mode_enumeration_unavailable"),
+        }
+        configuration
+            .validate()
+            .map_err(|_| "unsupported_physical_configuration")?;
+        let (domain_id, domain_revision) = self
+            .physical_domain
+            .as_ref()
+            .ok_or("physical_domain_unavailable")?;
+        let resources: Vec<_> = configuration
+            .displays
+            .iter()
+            .map(|display| PlannedResource {
+                provider: descriptor::PROVIDER.into(),
+                resource_id: display.id.clone(),
+                incarnation: None,
+                expected_revision: None,
+                execution_domain: self.request.consumer_requirements.execution_domain.clone(),
+                mutation_domains: vec![domain_id.clone()],
+                access: ResourceAccess::Exclusive,
+            })
+            .collect();
+        let obligations: Vec<_> = configuration
+            .displays
+            .iter()
+            .map(|display| ResourceObligation {
+                obligation_id: format!(
+                    "physical-cleanup-{}",
+                    stable_hex("physical-obligation", &display.id)
+                ),
+                provider: descriptor::PROVIDER.into(),
+                resource_id: display.id.clone(),
+                mutation_domain: Some(domain_id.clone()),
+                depends_on: vec![],
+                cleanup_method: MethodRef {
+                    service: descriptor::SERVICE.into(),
+                    method: "lifecycle_callback".into(),
+                    interface_major: 1,
+                    interface_minor: 0,
+                    schema_revision: 1,
+                },
+                payload: json!({"service":physical_display::SERVICE,"identity":display.id}),
+            })
+            .collect();
+        let plan = ResourcePlan {
+            plan_id: format!(
+                "display-plan-{}",
+                stable_hex("plan", &self.request.transition_id)
+            ),
+            revision: self.request.provider_sequence,
+            resources,
+            mutation_domains: vec![MutationDomainPlan {
+                domain: domain_id.clone(),
+                expected_revision: *domain_revision,
+                borrowers: BTreeMap::new(),
+                access: ResourceAccess::Exclusive,
+            }],
+            required_capabilities: vec![],
+            constraints: json!({"physical":{"provider":physical_display::SERVICE,"configuration":configuration,"expected_topology_revision":topology_revision,"expected_mutation_domain_id":domain_id,"expected_mutation_domain_revision":domain_revision}}),
+            obligations,
+            affected_consumers: vec![],
+            consumer_change: ConsumerChange::ReconnectRequired,
+            candidate_constraint: None,
+            allowed_degradation: vec![],
+        };
+        extension_api::validate_resource_plan(&plan).map_err(|_| "invalid_resource_plan")?;
+        Ok(plan)
     }
     fn virtual_plan(&self, payload: &Value) -> Result<ResourcePlan, &'static str> {
         let Selection::Virtual {
@@ -745,6 +898,60 @@ mod tests {
         assert_eq!(
             select_physical(&configuration, &settings),
             Err("physical_target_ambiguous")
+        );
+    }
+    #[test]
+    fn physical_plan_fences_the_whole_snapshot_with_separate_revisions() {
+        let mut planner = Planner::new(COORDINATOR, request(), Some(2), 0, |_| true).unwrap();
+        planner.physical_domain = Some(("physical_provider_session:abc".into(), 9));
+        let display = |id: &str, x| physical_display::DisplaySetting {
+            id: id.into(),
+            width: 1920,
+            height: 1080,
+            refresh: physical_display::Rational {
+                numerator: 60,
+                denominator: 1,
+            },
+            x,
+            y: 0,
+            rotation: physical_display::Rotation::Identity,
+            hdr_enabled: Some(true),
+        };
+        let snapshot = physical_display::Configuration {
+            displays: vec![display("primary", 0), display("other", 1920)],
+        };
+        let topology = "0123456789abcdef0123456789abcdef";
+        let plan = planner.physical_plan(snapshot, topology).unwrap();
+        assert_eq!(plan.resources.len(), 2);
+        assert_eq!(plan.obligations.len(), 2);
+        assert_eq!(plan.mutation_domains[0].expected_revision, 9);
+        assert_eq!(
+            plan.constraints["physical"]["expected_topology_revision"],
+            topology
+        );
+        assert_eq!(
+            plan.constraints["physical"]["expected_mutation_domain_revision"],
+            9
+        );
+        assert_eq!(
+            plan.constraints["physical"]["expected_mutation_domain_id"],
+            "physical_provider_session:abc"
+        );
+        assert!(plan.candidate_constraint.is_none());
+        assert_eq!(extension_api::validate_resource_plan(&plan), Ok(()));
+        assert!(
+            plan.constraints["physical"]["configuration"]["displays"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|d| d["hdr_enabled"].is_null())
+        );
+        planner.physical_domain = None;
+        let configuration =
+            serde_json::from_value(plan.constraints["physical"]["configuration"].clone()).unwrap();
+        assert_eq!(
+            planner.physical_plan(configuration, topology),
+            Err("physical_domain_unavailable")
         );
     }
 }
