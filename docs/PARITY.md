@@ -19,9 +19,11 @@ producer is available. Restored handoffs require a matching snapshot-bound
 preservation proof. A test with the real broker, state service, lifecycle
 coordinator and both extensions completed ten alternating-mode streams, active
 and paused session endings, and a second session using the same native domain.
-The first two keyboard-triggered removals completed; further action lifecycle
-testing remains in progress. Native display and capture were simulated, so this
-evidence does not qualify hardware, capture or streaming. Some multi-session
+With simulated native and input services, a separate keyboard test completed two
+removals, resumed through generations 2 and 3, and ended the session. An exact
+retry after a lost completion reply did not replay effects or inject input.
+Native display and capture were simulated, so this evidence does not qualify
+hardware, capture or streaming. Some multi-session
 cases remain unqualified. The virtual-screen owner currently supports Linux and
 fences Windows startup; Windows qualification remains outstanding.
 

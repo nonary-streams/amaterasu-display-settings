@@ -42,8 +42,10 @@ mode setting, recovery, capture binding, or either platform works on hardware.
 A test using the real broker, state service, lifecycle coordinator and both
 extensions completed ten streams with alternating modes, active and paused
 session endings, and a second session using the same native domain. The native
-display and capture backends were simulated. The first two keyboard-triggered
-removals also completed; further action lifecycle testing remains in progress.
+display and capture backends were simulated. A separate test with simulated
+native and input services completed two keyboard-triggered removals, resumed
+through generations 2 and 3, and ended the session. It also retried an exact
+request after a lost completion reply without replaying effects or injecting input.
 These results do not establish native mode setting, capture, streaming or
 hardware behavior. The virtual-screen owner currently supports Linux; its
 Windows startup is fenced, and Windows qualification remains outstanding.
