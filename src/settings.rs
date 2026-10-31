@@ -121,8 +121,26 @@ impl Default for DisplaySettings {
     }
 }
 
+/// The lifecycle owner must retain these values independently of mode resolution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LifecycleSettings {
+    pub enabled: bool,
+    pub keepalive_while_paused: bool,
+    pub enforce_while_paused: bool,
+}
+
 impl DisplaySettings {
+    pub fn lifecycle_settings(&self) -> LifecycleSettings {
+        LifecycleSettings {
+            enabled: self.enabled,
+            keepalive_while_paused: self.keepalive_while_paused,
+            enforce_while_paused: self.enforce_while_paused,
+        }
+    }
+
     /// Validate settings before persistence and again before planning effects.
+    /// This projects display mode policy only; use `lifecycle_settings` for
+    /// activation and paused-session behavior.
     pub fn to_policy(&self) -> Result<DisplayPolicy, &'static str> {
         let manual_resolution = Resolution {
             width: self.width,
@@ -197,6 +215,14 @@ mod tests {
         let settings: DisplaySettings = serde_json::from_value(json!({})).unwrap();
         assert_eq!(settings, DisplaySettings::default());
         assert!(!settings.enforce_while_paused);
+        assert_eq!(
+            settings.lifecycle_settings(),
+            LifecycleSettings {
+                enabled: false,
+                keepalive_while_paused: false,
+                enforce_while_paused: false
+            }
+        );
         assert_eq!(
             settings.to_policy().unwrap().retention,
             RetentionPolicy::UntilSessionEnds
