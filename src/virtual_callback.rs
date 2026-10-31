@@ -26,8 +26,15 @@ pub(crate) fn producer_incarnation(
     identity: &str,
     output: &wire::ObservedOutput,
 ) -> String {
-    let bytes =
-        serde_json::to_vec(&(domain_id, identity, output)).expect("typed output serializes");
+    let bytes = serde_json::to_vec(&(
+        domain_id,
+        identity,
+        &output.protocol,
+        &output.compositor_id,
+        output.registry_global,
+        &output.output_name,
+    ))
+    .expect("typed output serializes");
     format!("{:x}", Sha256::digest(bytes))
 }
 
@@ -998,6 +1005,12 @@ mod tests {
         let mut second = first.clone();
         second.borrow_id = "c".repeat(64);
         second.mutation_domain.revision += 1;
+        assert_eq!(
+            producer_incarnation(DOMAIN, ID, &first.observed_output),
+            producer_incarnation(DOMAIN, ID, &second.observed_output)
+        );
+        second.observed_output.width = 1280;
+        second.observed_output.height = 720;
         assert_eq!(
             producer_incarnation(DOMAIN, ID, &first.observed_output),
             producer_incarnation(DOMAIN, ID, &second.observed_output)
