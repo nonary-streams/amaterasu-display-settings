@@ -65,12 +65,15 @@ Validate both imports before enabling effects. Retire owned resources under the
 old caller and provider first; the new virtual-screen owner does not adopt old
 caller-scoped leases or native journals, and settings documents do not transfer
 native ownership.
-The Core repository's `scripts/export_session_extension_split.py` can produce a
-non-mutating, reviewable split plan for a fresh destination. It retains settings
-fields here and maps the four lifecycle fields to virtual-screen; it validates
-candidate values against supplied descriptors and requires an explicit owner
-`enabled` choice. It does not contact the registry, apply imports, validate with
-providers, or migrate an existing state root. It has been exercised with the
-legacy and display-v2 descriptors and a draft owner descriptor; the latest owner
-descriptor and live import still need validation. See the Core repository's
-`docs/session-extensions-local-profile.md` for the procedure and limits.
+The Core repository's `scripts/export_session_extension_split.py` produces a
+non-mutating, reviewable split plan for a fresh destination and preserves the
+source document. It accepts the final owner descriptor, including its nullable
+shortcut, and requires an explicit owner `enabled` choice. The current owner has
+fixed lifecycle behavior: the tool omits legacy lifecycle fields when they have
+their supported defaults and rejects unsupported nondefault values. It does not
+import a shortcut. Candidate values are validated against supplied descriptors;
+the final descriptors have also been exercised with the Rust schema validator
+and the script's tests. The tool does not contact the registry, apply imports,
+validate with providers, or migrate an existing state root. Live import remains
+unvalidated. See the Core repository's `docs/session-extensions-local-profile.md`
+for the procedure and limits.

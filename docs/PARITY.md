@@ -28,9 +28,13 @@ fences Windows startup; Windows qualification remains outstanding.
 Revision-1 combined settings and old caller-owned resources require explicit
 export, review and retirement under the old owner before a fresh profile is
 enabled. Neither settings nor the new owner adopts native leases or journals.
-The offline split export has been tested with legacy and display-v2 descriptors
-and a draft owner descriptor; the latest owner descriptor and live registry
-import remain unvalidated. Applying and validating an upgrade is an operator task.
+The offline split export preserves the source and accepts the final owner
+descriptor, including its nullable shortcut. It requires an explicit owner
+enabled choice, omits legacy lifecycle fields at their supported defaults,
+rejects unsupported nondefault values, and does not import a shortcut. Its
+descriptor validation has been exercised with the Rust schema validator and
+script tests; live registry import remains unvalidated. Applying and validating
+an upgrade is an operator task.
 
 ## Historical baseline: public services and ownership
 
