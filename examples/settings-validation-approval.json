@@ -1,13 +1,30 @@
 {
   "provider": "nonary.display-settings",
-  "callers": ["amaterasu.extension-registry", "amaterasu.management"],
+  "callers": [
+    "amaterasu.extension-registry"
+  ],
   "method": {
-    "service": "nonary.display-settings/1",
+    "service": "nonary.display-settings/2",
     "method": "settings_validate",
-    "interface_major": 1,
+    "interface_major": 2,
     "interface_minor": 0,
-    "request": {"required": {"values": "object"}, "optional": {}, "allow_extra": false},
-    "response": {"required": {"ok": "boolean", "valid": "boolean"}, "optional": {"message": "string"}, "allow_extra": false},
+    "request": {
+      "required": {
+        "values": "object"
+      },
+      "optional": {},
+      "allow_extra": false
+    },
+    "response": {
+      "required": {
+        "ok": "boolean",
+        "valid": "boolean"
+      },
+      "optional": {
+        "message": "string"
+      },
+      "allow_extra": false
+    },
     "privilege": "user"
   }
 }

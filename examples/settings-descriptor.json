@@ -1,11 +1,11 @@
 {
   "provider": "nonary.display-settings",
-  "revision": 1,
+  "revision": 2,
   "options": [
     {
       "id": "display_target",
       "label": "display target",
-      "help": "Applied on a future session after provider support is verified.",
+      "help": "Applied on a future stream after provider support is verified.",
       "definition": {
         "type": "enum",
         "default": "virtual",
@@ -21,13 +21,13 @@
         "paired_client",
         "session"
       ],
-      "apply_policy": "next_session",
+      "apply_policy": "next_stream",
       "required_capabilities": []
     },
     {
       "id": "enabled",
       "label": "enabled",
-      "help": "Applied on a future session after provider support is verified.",
+      "help": "Applied on a future stream after provider support is verified.",
       "definition": {
         "type": "boolean",
         "default": false
@@ -39,31 +39,13 @@
         "paired_client",
         "session"
       ],
-      "apply_policy": "next_session",
-      "required_capabilities": []
-    },
-    {
-      "id": "enforce_while_paused",
-      "label": "enforce while paused",
-      "help": "Applied on a future session after provider support is verified.",
-      "definition": {
-        "type": "boolean",
-        "default": false
-      },
-      "presentation": null,
-      "allowed_scopes": [
-        "host",
-        "application",
-        "paired_client",
-        "session"
-      ],
-      "apply_policy": "next_session",
+      "apply_policy": "next_stream",
       "required_capabilities": []
     },
     {
       "id": "hdr",
       "label": "hdr",
-      "help": "Applied on a future session after provider support is verified.",
+      "help": "Applied on a future stream after provider support is verified.",
       "definition": {
         "type": "enum",
         "default": "preserve",
@@ -79,13 +61,13 @@
         "paired_client",
         "session"
       ],
-      "apply_policy": "next_session",
+      "apply_policy": "next_stream",
       "required_capabilities": []
     },
     {
       "id": "hdr_request_override",
       "label": "hdr request override",
-      "help": "Applied on a future session after provider support is verified.",
+      "help": "Applied on a future stream after provider support is verified.",
       "definition": {
         "type": "enum",
         "default": "follow_client",
@@ -102,13 +84,13 @@
         "paired_client",
         "session"
       ],
-      "apply_policy": "next_session",
+      "apply_policy": "next_stream",
       "required_capabilities": []
     },
     {
       "id": "height",
       "label": "height",
-      "help": "Applied on a future session after provider support is verified.",
+      "help": "Applied on a future stream after provider support is verified.",
       "definition": {
         "type": "integer",
         "default": 1080,
@@ -122,31 +104,13 @@
         "paired_client",
         "session"
       ],
-      "apply_policy": "next_session",
-      "required_capabilities": []
-    },
-    {
-      "id": "keepalive_while_paused",
-      "label": "keepalive while paused",
-      "help": "Applied on a future session after provider support is verified.",
-      "definition": {
-        "type": "boolean",
-        "default": false
-      },
-      "presentation": null,
-      "allowed_scopes": [
-        "host",
-        "application",
-        "paired_client",
-        "session"
-      ],
-      "apply_policy": "next_session",
+      "apply_policy": "next_stream",
       "required_capabilities": []
     },
     {
       "id": "layout",
       "label": "layout",
-      "help": "Applied on a future session after provider support is verified.",
+      "help": "Applied on a future stream after provider support is verified.",
       "definition": {
         "type": "enum",
         "default": "preserve",
@@ -166,13 +130,13 @@
         "paired_client",
         "session"
       ],
-      "apply_policy": "next_session",
+      "apply_policy": "next_stream",
       "required_capabilities": []
     },
     {
       "id": "physical_display_id",
       "label": "physical display id",
-      "help": "Applied on a future session after provider support is verified.",
+      "help": "Applied on a future stream after provider support is verified.",
       "definition": {
         "type": "string",
         "default": "",
@@ -186,13 +150,13 @@
         "paired_client",
         "session"
       ],
-      "apply_policy": "next_session",
+      "apply_policy": "next_stream",
       "required_capabilities": []
     },
     {
       "id": "physical_target",
       "label": "physical target",
-      "help": "Applied on a future session after provider support is verified.",
+      "help": "Applied on a future stream after provider support is verified.",
       "definition": {
         "type": "enum",
         "default": "automatic",
@@ -208,13 +172,13 @@
         "paired_client",
         "session"
       ],
-      "apply_policy": "next_session",
+      "apply_policy": "next_stream",
       "required_capabilities": []
     },
     {
       "id": "refresh",
       "label": "refresh",
-      "help": "Applied on a future session after provider support is verified.",
+      "help": "Applied on a future stream after provider support is verified.",
       "definition": {
         "type": "enum",
         "default": "preserve",
@@ -232,13 +196,13 @@
         "paired_client",
         "session"
       ],
-      "apply_policy": "next_session",
+      "apply_policy": "next_stream",
       "required_capabilities": []
     },
     {
       "id": "refresh_denominator",
       "label": "refresh denominator",
-      "help": "Applied on a future session after provider support is verified.",
+      "help": "Applied on a future stream after provider support is verified.",
       "definition": {
         "type": "integer",
         "default": 1,
@@ -252,13 +216,13 @@
         "paired_client",
         "session"
       ],
-      "apply_policy": "next_session",
+      "apply_policy": "next_stream",
       "required_capabilities": []
     },
     {
       "id": "refresh_numerator",
       "label": "refresh numerator",
-      "help": "Applied on a future session after provider support is verified.",
+      "help": "Applied on a future stream after provider support is verified.",
       "definition": {
         "type": "integer",
         "default": 60,
@@ -272,13 +236,13 @@
         "paired_client",
         "session"
       ],
-      "apply_policy": "next_session",
+      "apply_policy": "next_stream",
       "required_capabilities": []
     },
     {
       "id": "resolution",
       "label": "resolution",
-      "help": "Applied on a future session after provider support is verified.",
+      "help": "Applied on a future stream after provider support is verified.",
       "definition": {
         "type": "enum",
         "default": "preserve",
@@ -295,56 +259,13 @@
         "paired_client",
         "session"
       ],
-      "apply_policy": "next_session",
-      "required_capabilities": []
-    },
-    {
-      "id": "retention",
-      "label": "retention",
-      "help": "Applied on a future session after provider support is verified.",
-      "definition": {
-        "type": "enum",
-        "default": "until_session_ends",
-        "options": [
-          "until_session_ends",
-          "after_disconnect",
-          "until_explicit_release"
-        ]
-      },
-      "presentation": null,
-      "allowed_scopes": [
-        "host",
-        "application",
-        "paired_client",
-        "session"
-      ],
-      "apply_policy": "next_session",
-      "required_capabilities": []
-    },
-    {
-      "id": "retention_seconds",
-      "label": "retention seconds",
-      "help": "Applied on a future session after provider support is verified.",
-      "definition": {
-        "type": "integer",
-        "default": 300,
-        "minimum": 0,
-        "maximum": 4294967295
-      },
-      "presentation": null,
-      "allowed_scopes": [
-        "host",
-        "application",
-        "paired_client",
-        "session"
-      ],
-      "apply_policy": "next_session",
+      "apply_policy": "next_stream",
       "required_capabilities": []
     },
     {
       "id": "scale_percent",
       "label": "scale percent",
-      "help": "Applied on a future session after provider support is verified.",
+      "help": "Applied on a future stream after provider support is verified.",
       "definition": {
         "type": "integer",
         "default": 100,
@@ -358,13 +279,13 @@
         "paired_client",
         "session"
       ],
-      "apply_policy": "next_session",
+      "apply_policy": "next_stream",
       "required_capabilities": []
     },
     {
       "id": "scaling",
       "label": "scaling",
-      "help": "Applied on a future session after provider support is verified.",
+      "help": "Applied on a future stream after provider support is verified.",
       "definition": {
         "type": "enum",
         "default": "preserve",
@@ -381,13 +302,13 @@
         "paired_client",
         "session"
       ],
-      "apply_policy": "next_session",
+      "apply_policy": "next_stream",
       "required_capabilities": []
     },
     {
       "id": "width",
       "label": "width",
-      "help": "Applied on a future session after provider support is verified.",
+      "help": "Applied on a future stream after provider support is verified.",
       "definition": {
         "type": "integer",
         "default": 1920,
@@ -401,50 +322,16 @@
         "paired_client",
         "session"
       ],
-      "apply_policy": "next_session",
+      "apply_policy": "next_stream",
       "required_capabilities": []
     }
   ],
-  "actions": [
-    {
-      "id": "nonary.display-settings/remove-owned",
-      "label": "remove owned",
-      "description": "Changes a display owned by the selected session after its consumers retire.",
-      "execution": "session_mutation",
-      "arguments": {},
-      "allowed_targets": [
-        "session",
-        "stream"
-      ],
-      "required_capabilities": [],
-      "plan": {
-        "service": "nonary.display-settings/1",
-        "method": "action_plan",
-        "interface_major": 1,
-        "interface_minor": 0,
-        "schema_revision": 1
-      },
-      "execute": {
-        "service": "nonary.display-settings/1",
-        "method": "action_execute",
-        "interface_major": 1,
-        "interface_minor": 0,
-        "schema_revision": 1
-      },
-      "status": {
-        "service": "nonary.display-settings/1",
-        "method": "action_status",
-        "interface_major": 1,
-        "interface_minor": 0,
-        "schema_revision": 1
-      }
-    }
-  ],
+  "actions": [],
   "capabilities": [],
   "settings_validate": {
-    "service": "nonary.display-settings/1",
+    "service": "nonary.display-settings/2",
     "method": "settings_validate",
-    "interface_major": 1,
+    "interface_major": 2,
     "interface_minor": 0,
     "schema_revision": 1
   }

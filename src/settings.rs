@@ -4,11 +4,10 @@
 //! Numeric values belonging to an inactive choice remain stored for later use;
 //! they are validated even while inactive, and affect policy only when selected.
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
 use crate::policy::{
     DisplayPolicy, HdrPolicy, HdrRequestOverride, LayoutPolicy, RefreshPolicy, RefreshRate,
-    Resolution, ResolutionPolicy, RetentionPolicy, ScalingPolicy,
+    Resolution, ResolutionPolicy, ScalingPolicy,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -29,10 +28,6 @@ pub struct DisplaySettings {
     pub scaling: ScalingSetting,
     pub scale_percent: u16,
     pub layout: LayoutSetting,
-    pub retention: RetentionSetting,
-    pub retention_seconds: u32,
-    pub keepalive_while_paused: bool,
-    pub enforce_while_paused: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -117,15 +112,6 @@ pub enum LayoutSetting {
     ExtendedPrimaryIsolated,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RetentionSetting {
-    #[default]
-    UntilSessionEnds,
-    AfterDisconnect,
-    UntilExplicitRelease,
-}
-
 impl Default for DisplaySettings {
     fn default() -> Self {
         Self {
@@ -144,10 +130,6 @@ impl Default for DisplaySettings {
             scaling: ScalingSetting::Preserve,
             scale_percent: 100,
             layout: LayoutSetting::Preserve,
-            retention: RetentionSetting::UntilSessionEnds,
-            retention_seconds: 300,
-            keepalive_while_paused: false,
-            enforce_while_paused: false,
         }
     }
 }
@@ -156,8 +138,6 @@ impl Default for DisplaySettings {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LifecycleSettings {
     pub enabled: bool,
-    pub keepalive_while_paused: bool,
-    pub enforce_while_paused: bool,
 }
 
 impl DisplaySettings {
@@ -185,14 +165,12 @@ impl DisplaySettings {
     pub fn lifecycle_settings(&self) -> LifecycleSettings {
         LifecycleSettings {
             enabled: self.enabled,
-            keepalive_while_paused: self.keepalive_while_paused,
-            enforce_while_paused: self.enforce_while_paused,
         }
     }
 
     /// Validate settings before persistence and again before planning effects.
     /// This projects display mode policy only; use `lifecycle_settings` for
-    /// activation and paused-session behavior.
+    /// activation.
     pub fn to_policy(&self) -> Result<DisplayPolicy, &'static str> {
         self.display_selection()?;
         let manual_resolution = Resolution {
@@ -247,13 +225,6 @@ impl DisplaySettings {
                 LayoutSetting::ExtendedIsolated => LayoutPolicy::ExtendedIsolated,
                 LayoutSetting::ExtendedPrimaryIsolated => LayoutPolicy::ExtendedPrimaryIsolated,
             },
-            retention: match self.retention {
-                RetentionSetting::UntilSessionEnds => RetentionPolicy::UntilSessionEnds,
-                RetentionSetting::AfterDisconnect => RetentionPolicy::AfterDisconnect(
-                    Duration::from_secs(u64::from(self.retention_seconds)),
-                ),
-                RetentionSetting::UntilExplicitRelease => RetentionPolicy::UntilExplicitRelease,
-            },
         })
     }
 }
@@ -264,22 +235,9 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn defaults_preserve_without_enforcement_and_round_trip() {
+    fn defaults_preserve_and_round_trip() {
         let settings: DisplaySettings = serde_json::from_value(json!({})).unwrap();
         assert_eq!(settings, DisplaySettings::default());
-        assert!(!settings.enforce_while_paused);
-        assert_eq!(
-            settings.lifecycle_settings(),
-            LifecycleSettings {
-                enabled: false,
-                keepalive_while_paused: false,
-                enforce_while_paused: false
-            }
-        );
-        assert_eq!(
-            settings.to_policy().unwrap().retention,
-            RetentionPolicy::UntilSessionEnds
-        );
         assert_eq!(
             serde_json::from_value::<DisplaySettings>(serde_json::to_value(&settings).unwrap())
                 .unwrap(),
@@ -293,6 +251,10 @@ mod tests {
             json!({"unexpected": true}),
             json!({"resolution":{"kind":"manual","width":1,"height":2}}),
             json!({"layout":"unknown"}),
+            json!({"retention":"until_session_ends"}),
+            json!({"retention_seconds":300}),
+            json!({"keepalive_while_paused":false}),
+            json!({"enforce_while_paused":false}),
         ] {
             assert!(serde_json::from_value::<DisplaySettings>(value).is_err());
         }
@@ -312,7 +274,7 @@ mod tests {
 
     #[test]
     fn selected_manual_fields_drive_policy() {
-        let settings: DisplaySettings = serde_json::from_value(json!({"resolution":"manual","width":2560,"height":1440,"refresh":"manual","refresh_numerator":60000,"refresh_denominator":1001,"scaling":"percent","scale_percent":125,"retention":"after_disconnect","retention_seconds":60})).unwrap();
+        let settings: DisplaySettings = serde_json::from_value(json!({"resolution":"manual","width":2560,"height":1440,"refresh":"manual","refresh_numerator":60000,"refresh_denominator":1001,"scaling":"percent","scale_percent":125})).unwrap();
         let policy = settings.to_policy().unwrap();
         assert_eq!(
             policy.resolution,
@@ -329,10 +291,6 @@ mod tests {
             })
         );
         assert_eq!(policy.scaling, ScalingPolicy::Percent(125));
-        assert_eq!(
-            policy.retention,
-            RetentionPolicy::AfterDisconnect(Duration::from_secs(60))
-        );
     }
 
     #[test]

@@ -41,6 +41,7 @@ dependencies = [
  "amaterasu-configuration-schema",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

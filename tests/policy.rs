@@ -1,5 +1,4 @@
 use amaterasu_display_settings::policy::*;
-use std::time::Duration;
 
 fn resolution(width: u32, height: u32) -> Resolution {
     Resolution { width, height }
@@ -20,7 +19,6 @@ fn base() -> DisplayPolicy {
         hdr_request_override: HdrRequestOverride::FollowClient,
         scaling: ScalingPolicy::Preserve,
         layout: LayoutPolicy::Preserve,
-        retention: RetentionPolicy::UntilSessionEnds,
     }
 }
 
@@ -159,14 +157,14 @@ fn provider_capabilities_fail_closed_and_hdr_override_is_explicit() {
 }
 
 #[test]
-fn scale_layout_and_retention_require_explicit_support() {
+fn scale_and_layout_require_explicit_support() {
     let mut policy = base();
     policy.scaling = ScalingPolicy::Automatic;
     assert_eq!(
         resolve_policy(policy, client(), &[], ProviderCapabilities::default()),
         Err(PolicyError::UnsupportedScaling)
     );
-    let mut capabilities = ProviderCapabilities {
+    let capabilities = ProviderCapabilities {
         scaling: true,
         ..ProviderCapabilities::default()
     };
@@ -186,18 +184,5 @@ fn scale_layout_and_retention_require_explicit_support() {
     assert_eq!(
         resolve_policy(policy, client(), &[], capabilities),
         Err(PolicyError::UnsupportedLayout)
-    );
-    capabilities.layout = true;
-    policy.retention = RetentionPolicy::AfterDisconnect(Duration::from_secs(30));
-    assert_eq!(
-        resolve_policy(policy, client(), &[], capabilities),
-        Err(PolicyError::UnsupportedRetention)
-    );
-    capabilities.retention = true;
-    assert_eq!(
-        resolve_policy(policy, client(), &[], capabilities)
-            .unwrap()
-            .retention,
-        policy.retention
     );
 }

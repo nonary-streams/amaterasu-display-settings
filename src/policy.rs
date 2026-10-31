@@ -1,8 +1,6 @@
 //! Pure display intent resolution. A resolved intent is not evidence that a
 //! provider has applied it, or that a display advertises the requested mode.
 
-use std::time::Duration;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Resolution {
     pub width: u32,
@@ -90,14 +88,6 @@ pub enum LayoutPolicy {
     ExtendedPrimaryIsolated,
 }
 
-/// Retention is an intent for a lifecycle owner, not a scheduled operation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RetentionPolicy {
-    UntilSessionEnds,
-    AfterDisconnect(Duration),
-    UntilExplicitRelease,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DisplayPolicy {
     pub resolution: ResolutionPolicy,
@@ -106,7 +96,6 @@ pub struct DisplayPolicy {
     pub hdr_request_override: HdrRequestOverride,
     pub scaling: ScalingPolicy,
     pub layout: LayoutPolicy,
-    pub retention: RetentionPolicy,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -124,7 +113,6 @@ pub struct ResolvedDisplayPolicy {
     /// None preserves the provider's existing scaling.
     pub scale_percent: Option<u16>,
     pub layout: LayoutPolicy,
-    pub retention: RetentionPolicy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,7 +127,6 @@ pub enum PolicyError {
     UnsupportedHdr,
     UnsupportedScaling,
     UnsupportedLayout,
-    UnsupportedRetention,
 }
 
 /// Explicit provider capabilities. A caller must obtain these from the actual
@@ -149,7 +136,6 @@ pub struct ProviderCapabilities {
     pub hdr: bool,
     pub scaling: bool,
     pub layout: bool,
-    pub retention: bool,
 }
 
 const SUPPORTED_SCALES: [u16; 12] = [100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500];
@@ -249,16 +235,12 @@ pub fn resolve_policy(
     if policy.layout != LayoutPolicy::Preserve && !capabilities.layout {
         return Err(PolicyError::UnsupportedLayout);
     }
-    if policy.retention != RetentionPolicy::UntilSessionEnds && !capabilities.retention {
-        return Err(PolicyError::UnsupportedRetention);
-    }
     Ok(ResolvedDisplayPolicy {
         resolution,
         refresh,
         hdr,
         scale_percent,
         layout: policy.layout,
-        retention: policy.retention,
     })
 }
 

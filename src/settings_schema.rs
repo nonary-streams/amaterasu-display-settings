@@ -74,26 +74,6 @@ pub fn definitions() -> Fields {
                 ],
             ),
         ),
-        (
-            "retention",
-            choices(
-                "until_session_ends",
-                &[
-                    "until_session_ends",
-                    "after_disconnect",
-                    "until_explicit_release",
-                ],
-            ),
-        ),
-        ("retention_seconds", number(300, 0, u32::MAX.into())),
-        (
-            "keepalive_while_paused",
-            Definition::Boolean { default: false },
-        ),
-        (
-            "enforce_while_paused",
-            Definition::Boolean { default: false },
-        ),
     ]
     .into_iter()
     .map(|(key, definition)| (key.to_owned(), definition))
