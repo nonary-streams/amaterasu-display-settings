@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 
 const DISPLAY_TARGET_SCHEMA: &str = "amaterasu.display-target/1";
 const DISPLAY_TARGET_DIGEST: &str =
-    "8521cdfd92da98b25136bd01720d397f0d7fee14748c08afde76a0379fa18941";
+    "ededc620113268bcae3990d492deeef039c5e9c5ff28067a676dd992fe6324ce";
 const DISPLAY_CONTROL_SCHEMA: &str = "amaterasu.display-control/1";
 const DISPLAY_CONTROL_DIGEST: &str =
     "c2c3ce866277cb29bbd9fbd947899917538d46b1020df3197fbd264159607d87";
@@ -238,16 +238,11 @@ fn composed_configure(
     if settings.scaling != ScalingSetting::Preserve
         || settings.hdr != HdrSetting::Preserve
         || settings.hdr_request_override != HdrOverrideSetting::FollowClient
-        || data["mode"]["hdr"] != false
+        || data["mode"]["hdr"] == true
         || (settings.display_target == DisplayTargetSetting::Physical
             && settings.layout != LayoutSetting::Preserve)
     {
         return Err("display_policy_unsupported");
-    }
-    if data["scale_percent"].as_u64().is_none()
-        || (settings.layout == LayoutSetting::Preserve && data["layout"].as_str().is_none())
-    {
-        return Err("preserved_state_unavailable");
     }
     let observed = &data["mode"];
     let client = request.requested_video.as_ref();
@@ -383,10 +378,10 @@ mod tests {
         assert!(plan_composed(&request).is_err());
         request.dependency_inputs.pop();
         request.dependency_inputs[0].data["mode"]["hdr"] = Value::Null;
-        assert_eq!(plan_composed(&request), Err("display_policy_unsupported"));
+        assert!(plan_composed(&request).is_ok());
         request.dependency_inputs[0].data["mode"]["hdr"] = json!(false);
         request.dependency_inputs[0].data["scale_percent"] = Value::Null;
-        assert_eq!(plan_composed(&request), Err("preserved_state_unavailable"));
+        assert!(plan_composed(&request).is_ok());
         request.dependency_inputs[0].data["scale_percent"] = json!(100);
         request.dependency_inputs[0].domain_observations[0].domain = "other".into();
         assert_eq!(plan_composed(&request), Err("invalid_request"));

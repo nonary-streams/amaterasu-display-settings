@@ -87,7 +87,7 @@ pub fn composition_callback(request: &ProviderRequest) -> Result<ProviderRespons
             || input.schema.major != 1
             || input.schema.minor != 0
             || input.schema.digest
-                != "8521cdfd92da98b25136bd01720d397f0d7fee14748c08afde76a0379fa18941"
+                != "ededc620113268bcae3990d492deeef039c5e9c5ff28067a676dd992fe6324ce"
             || proposal.argument_schema.id != "amaterasu.display-control/1"
             || proposal.argument_schema.major != 1
             || proposal.argument_schema.minor != 0
@@ -212,22 +212,23 @@ fn matches_requested_mode(
             return false;
         }
     }
+    let proof = valid_preservation_proof(output);
     let hdr_matches = match arguments.get("hdr").and_then(|v| v.as_str()) {
-        Some("preserve") => input
-            .pointer("/mode/hdr")
-            .and_then(|v| v.as_bool())
-            .is_some_and(|prior| mode.get("hdr").and_then(|v| v.as_bool()) == Some(prior)),
+        Some("preserve") => preserved(
+            input.pointer("/mode/hdr").and_then(|v| v.as_bool()),
+            mode.get("hdr").and_then(|v| v.as_bool()),
+            proof,
+        ),
         Some("on") => mode.get("hdr").and_then(|v| v.as_bool()) == Some(true),
         Some("off") => mode.get("hdr").and_then(|v| v.as_bool()) == Some(false),
         _ => false,
     };
     let scaling_matches = match arguments.pointer("/scaling/mode").and_then(|v| v.as_str()) {
-        Some("preserve") => input
-            .get("scale_percent")
-            .and_then(|v| v.as_u64())
-            .is_some_and(|prior| {
-                output.get("scale_percent").and_then(|v| v.as_u64()) == Some(prior)
-            }),
+        Some("preserve") => preserved(
+            input.get("scale_percent").and_then(|v| v.as_u64()),
+            output.get("scale_percent").and_then(|v| v.as_u64()),
+            proof,
+        ),
         Some("percent") => arguments
             .pointer("/scaling/percent")
             .and_then(|v| v.as_u64())
@@ -237,14 +238,45 @@ fn matches_requested_mode(
         _ => false,
     };
     let layout_matches = match arguments.get("layout").and_then(|v| v.as_str()) {
-        Some("preserve") => input
-            .get("layout")
-            .and_then(|v| v.as_str())
-            .is_some_and(|prior| output.get("layout").and_then(|v| v.as_str()) == Some(prior)),
+        Some("preserve") => preserved(
+            input.get("layout").and_then(|v| v.as_str()),
+            output.get("layout").and_then(|v| v.as_str()),
+            proof,
+        ),
         Some(layout) => output.get("layout").and_then(|v| v.as_str()) == Some(layout),
         _ => false,
     };
     hdr_matches && scaling_matches && layout_matches
+}
+
+fn preserved<T: PartialEq>(before: Option<T>, after: Option<T>, proof: bool) -> bool {
+    match (before, after) {
+        (Some(before), Some(after)) => before == after,
+        _ => proof,
+    }
+}
+
+fn valid_preservation_proof(output: &serde_json::Value) -> bool {
+    let Some(proof) = output.get("preservation_proof") else {
+        return false;
+    };
+    let Some(snapshot) = output
+        .get("snapshot_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    let Some(digest) = proof.get("before_digest").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    proof.get("kind").and_then(|v| v.as_str()) == Some("mode_only_preserved")
+        && proof.get("snapshot_id").and_then(|v| v.as_str()) == Some(snapshot)
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && proof.get("after_digest").and_then(|v| v.as_str()) == Some(digest)
 }
 
 #[cfg(test)]
@@ -255,7 +287,7 @@ mod tests {
     fn fixture() -> ProviderRequest {
         let target = json!({"kind":"stream","host_epoch":"epoch-1","session_id":"session-1","stream_id":"stream-1","generation":1});
         let resource = json!({"provider":"example.screen","resource_id":"screen-1","incarnation":"inc-1","revision":1,"execution_domain":"desktop","mutation_domain":"domain-1","mutation_domains":["domain-1"]});
-        let schema = json!({"id":"amaterasu.display-target/1","major":1,"minor":0,"digest":"8521cdfd92da98b25136bd01720d397f0d7fee14748c08afde76a0379fa18941"});
+        let schema = json!({"id":"amaterasu.display-target/1","major":1,"minor":0,"digest":"ededc620113268bcae3990d492deeef039c5e9c5ff28067a676dd992fe6324ce"});
         let data = json!({"control_state":"configured","native_state":"active","snapshot_id":"snapshot-1","mode":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false},"scale_percent":150,"layout":"extended"});
         let input = json!({"output_id":"output-1","capability":"amaterasu.display-target","schema":schema,"producer":"example.screen","producer_service":"example.screen/2","origin":target,"resource":resource,"domain_observations":[{"domain":"domain-1","revision":1,"borrowers":{},"complete":true}],"data":data});
         let proposal = json!({"proposal_id":"proposal-1","output_id":"output-1","owner_provider":"example.screen","owner_service":"example.screen/2","target":target,"resource":resource,"method":{"service":"example.screen/2","method":"resource_control","interface_major":2,"interface_minor":0,"schema_revision":1},"argument_schema":{"id":"amaterasu.display-control/1","major":1,"minor":0,"digest":"c2c3ce866277cb29bbd9fbd947899917538d46b1020df3197fbd264159607d87"},"arguments":{"operation":"configure","width":1920,"height":1080,"refresh_millihz":60000,"hdr":"off","scaling":{"mode":"percent","percent":150},"layout":"extended"},"access":"exclusive","mutation_domains":["domain-1"]});
@@ -333,6 +365,27 @@ mod tests {
             composition_callback(&request),
             Err("configuration_not_confirmed")
         );
+        let proof = json!({"kind":"mode_only_preserved","snapshot_id":"snapshot-1","before_digest":"a".repeat(64),"after_digest":"a".repeat(64)});
+        request.control_results[0].output.data["preservation_proof"] = proof.clone();
+        assert!(composition_callback(&request).is_ok());
+        request.control_results[0].output.data["mode"]["hdr"] = json!(true);
+        assert_eq!(
+            composition_callback(&request),
+            Err("configuration_not_confirmed")
+        );
+        request.control_results[0].output.data["mode"]["hdr"] = json!(false);
+        for (field, invalid) in [
+            ("snapshot_id", json!("other")),
+            ("before_digest", json!("A".repeat(64))),
+            ("after_digest", json!("b".repeat(64))),
+        ] {
+            request.control_results[0].output.data["preservation_proof"] = proof.clone();
+            request.control_results[0].output.data["preservation_proof"][field] = invalid;
+            assert_eq!(
+                composition_callback(&request),
+                Err("configuration_not_confirmed")
+            );
+        }
     }
 
     #[test]
