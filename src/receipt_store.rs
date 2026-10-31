@@ -1,21 +1,52 @@
-//! Durable, bounded operation receipts using only `amaterasu.state/1`.
+//! Durable, bounded provider receipts via `amaterasu.state/1`.
 //!
-//! Every effectful operation must wait for `Begun` before dispatch. A previously
-//! pending operation is always recovery-required, never permission to replay.
-//! An unknown write may still be in flight: fence/reconcile its broker request
-//! before treating an absent lookup as authority to start again. Namespace and
-//! collection access are bound to the runtime-authenticated module identity.
+//! Only a coordinator-authenticated epoch may be used. An operation marked
+//! pending is never replayed; reconcile its native effects before completion.
+//! Epoch rollover additionally requires the coordinator to fence old callbacks.
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 const SERVICE: &str = "amaterasu.state/1";
-const COLLECTION: &str = "display-settings/operation-receipts-v1";
-const MAX_RECEIPTS: u64 = 64;
+const COLLECTION: &str = "display-settings/operation-receipts-v2";
+const WINDOW: u64 = 64;
 const MAX_CONTENT_BYTES: usize = 4096;
-const MAX_CAS_ATTEMPTS: u8 = 3;
-const MAX_TRANSPORT_FAILURES: u8 = 3;
+const MAX_FAILURES: u8 = 3;
 
+/// Authentication must check the exact selected lifecycle broker identity and
+/// current epoch with the coordinator. Payload fields alone are not authority.
+#[derive(Clone, Debug)]
+pub struct VerifiedEpoch(String);
+impl VerifiedEpoch {
+    pub fn authenticate(
+        epoch: String,
+        verify: impl FnOnce(&str) -> bool,
+    ) -> Result<Self, &'static str> {
+        if !valid_id(&epoch, 80) || !verify(&epoch) {
+            return Err("epoch_not_authenticated");
+        }
+        Ok(Self(epoch))
+    }
+}
+/// Authentication must additionally prove old callbacks have been fenced and
+/// no new call using the old epoch can arrive. Pending receipts survive the
+/// switch and block new work until they are reconciled.
+pub struct RolloverAuthorization {
+    old: String,
+    new: VerifiedEpoch,
+}
+impl RolloverAuthorization {
+    pub fn authenticate(
+        old: String,
+        new: VerifiedEpoch,
+        verify_fence: impl FnOnce(&str, &str) -> bool,
+    ) -> Result<Self, &'static str> {
+        if !valid_id(&old, 80) || old == new.0 || !verify_fence(&old, &new.0) {
+            return Err("rollover_not_authenticated");
+        }
+        Ok(Self { old, new })
+    }
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReceiptState {
@@ -29,60 +60,153 @@ pub struct Receipt {
     pub request: Value,
     pub state: ReceiptState,
 }
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Metadata {
+    format_version: u8,
+    epoch: String,
+    low: u64,
+    high: u64,
+    pending: u64,
+}
+impl Metadata {
+    fn empty(epoch: String) -> Self {
+        Self {
+            format_version: 2,
+            epoch,
+            low: 0,
+            high: 0,
+            pending: 0,
+        }
+    }
+    fn validate(&self, count: u64) -> bool {
+        self.format_version == 2
+            && valid_id(&self.epoch, 80)
+            && self.low <= self.high
+            && self.high - self.low <= WINDOW
+            && self.pending <= 1
+            && self.pending <= count
+            && count == self.high - self.low
+    }
+}
+/// Each `Complete` means the callback effect is settled and any remaining
+/// cleanup obligations are durably recorded separately.
+/// `Retire` permanently discards only the oldest completed receipt.
 pub enum Operation {
     Begin {
+        epoch: VerifiedEpoch,
+        sequence: u64,
         operation_id: String,
         request: Value,
     },
     Complete {
+        epoch: VerifiedEpoch,
+        sequence: u64,
         operation_id: String,
         request: Value,
         result: Value,
     },
     Lookup {
-        operation_id: String,
+        epoch: VerifiedEpoch,
+        sequence: u64,
+    },
+    Retire {
+        epoch: VerifiedEpoch,
+        sequence: u64,
+    },
+    Rollover {
+        authorization: RolloverAuthorization,
     },
 }
 impl Operation {
-    fn id(&self) -> &str {
+    fn epoch(&self) -> &str {
         match self {
-            Self::Begin { operation_id, .. }
-            | Self::Complete { operation_id, .. }
-            | Self::Lookup { operation_id } => operation_id,
+            Self::Begin { epoch, .. }
+            | Self::Complete { epoch, .. }
+            | Self::Lookup { epoch, .. }
+            | Self::Retire { epoch, .. } => &epoch.0,
+            Self::Rollover { authorization } => &authorization.old,
         }
     }
+    fn sequence(&self) -> Option<u64> {
+        match self {
+            Self::Begin { sequence, .. }
+            | Self::Complete { sequence, .. }
+            | Self::Lookup { sequence, .. }
+            | Self::Retire { sequence, .. } => Some(*sequence),
+            Self::Rollover { .. } => None,
+        }
+    }
+    fn key(&self) -> String {
+        self.sequence()
+            .map_or_else(|| "metadata".into(), |s| format!("{:020}", s))
+    }
     fn validate(&self) -> Result<(), &'static str> {
-        if !valid_operation_id(self.id()) {
-            return Err("invalid_operation_id");
+        if self.sequence() == Some(0) {
+            return Err("invalid_sequence");
         }
         match self {
-            Self::Begin { request, .. } => validate_content(request),
-            Self::Complete {
-                request, result, ..
+            Self::Begin {
+                request,
+                operation_id,
+                ..
             } => {
+                if !valid_operation_id(operation_id) {
+                    return Err("invalid_operation_id");
+                }
+                validate_content(request)
+            }
+            Self::Complete {
+                request,
+                result,
+                operation_id,
+                ..
+            } => {
+                if !valid_operation_id(operation_id) {
+                    return Err("invalid_operation_id");
+                }
                 validate_content(request)?;
                 validate_content(result)
             }
-            Self::Lookup { .. } => Ok(()),
+            _ => Ok(()),
+        }
+    }
+    fn receipt(&self, state: ReceiptState) -> Receipt {
+        let (operation_id, request) = match self {
+            Self::Begin {
+                operation_id,
+                request,
+                ..
+            }
+            | Self::Complete {
+                operation_id,
+                request,
+                ..
+            } => (operation_id.clone(), request.clone()),
+            _ => unreachable!(),
+        };
+        Receipt {
+            operation_id,
+            request,
+            state,
         }
     }
 }
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum Outcome {
-    /// Pending receipt durably committed. Only this outcome allows first dispatch.
     Begun,
-    /// No receipt at this instant. Does not fence an earlier unknown write.
     NotFound,
+    Expired,
     RecoveryRequired(Receipt),
     Completed(Receipt),
+    Retired,
+    RolledOver,
     Conflict,
     Capacity,
+    SequenceWindow,
+    EpochMismatch,
     Contended,
     ProviderError(String),
-    /// Broker admission, mutation, result release, or response was uncertain.
     Unknown,
 }
 #[derive(Clone, Debug, PartialEq)]
@@ -90,7 +214,6 @@ pub enum Progress {
     Waiting,
     Done(Outcome),
 }
-
 #[derive(Clone, Copy)]
 enum Phase {
     Read,
@@ -104,7 +227,8 @@ struct Exchange {
     uncertain: bool,
 }
 
-/// Owns one bounded state operation. One poll issues at most one broker command.
+/// One broker command per poll. Unknown writes require broker fencing and
+/// reconciliation; absence alone cannot disprove an in-flight write.
 pub struct PendingStoreOperation {
     operation: Operation,
     prefix: String,
@@ -114,23 +238,30 @@ pub struct PendingStoreOperation {
     phase: Phase,
     attempts: u8,
     exchange: Exchange,
-    write_receipt: Option<Receipt>,
+    write_outcome: Option<Outcome>,
     write_revision: Option<u64>,
     finished: Option<Outcome>,
 }
 impl PendingStoreOperation {
     pub fn new(
         operation: Operation,
-        broker_prefix: String,
+        prefix: String,
         parent: Option<u64>,
         timeout_ms: u64,
         now_ms: u64,
     ) -> Result<Self, &'static str> {
         operation.validate()?;
-        if !valid_id(&broker_prefix, 100) || !(1..=30_000).contains(&timeout_ms) {
+        if !valid_id(&prefix, 100) || !(1..=30_000).contains(&timeout_ms) {
             return Err("invalid_broker_operation");
         }
-        let mut this = Self {
+        let mut call = Self {
+            operation,
+            prefix,
+            parent,
+            timeout_ms,
+            deadline_ms: now_ms.saturating_add(timeout_ms),
+            phase: Phase::Read,
+            attempts: 0,
             exchange: Exchange {
                 command: Command::Request {
                     service: SERVICE.into(),
@@ -144,28 +275,21 @@ impl PendingStoreOperation {
                 failures: 0,
                 uncertain: false,
             },
-            operation,
-            prefix: broker_prefix,
-            parent,
-            timeout_ms,
-            deadline_ms: now_ms.saturating_add(timeout_ms),
-            phase: Phase::Read,
-            attempts: 0,
-            write_receipt: None,
+            write_outcome: None,
             write_revision: None,
             finished: None,
         };
-        this.start_read();
-        Ok(this)
+        call.start_read();
+        Ok(call)
     }
-    /// Broker request currently being reconciled, if admission was observed.
     pub fn request_id(&self) -> Option<u64> {
         self.exchange.request_id
     }
     fn start_read(&mut self) {
-        let payload =
-            json!({"action":"collection_get","collection":COLLECTION,"key":self.operation.id()});
-        self.set_exchange(payload, "read");
+        self.set_exchange(
+            json!({"action":"collection_get","collection":COLLECTION,"key":self.operation.key()}),
+            "read",
+        );
         self.phase = Phase::Read;
     }
     fn set_exchange(&mut self, payload: Value, label: &str) {
@@ -191,14 +315,14 @@ impl PendingStoreOperation {
         if let Some(outcome) = &self.finished {
             return Progress::Done(outcome.clone());
         }
-        if now_ms >= self.deadline_ms || self.exchange.failures >= MAX_TRANSPORT_FAILURES {
+        if now_ms >= self.deadline_ms || self.exchange.failures >= MAX_FAILURES {
             return self.done(Outcome::Unknown);
         }
         if let Some(id) = self.exchange.request_id {
             if self.exchange.result.is_some() {
                 match send(Command::ReleaseResult { request: id }) {
                     Ok(Response::Ok) => {
-                        let payload = self.exchange.result.take().expect("result present");
+                        let payload = self.exchange.result.take().expect("result");
                         self.consume(payload)
                     }
                     _ => {
@@ -247,13 +371,13 @@ impl PendingStoreOperation {
             };
             if matches!(self.phase, Phase::Write) && code == "revision_conflict" {
                 self.attempts += 1;
-                if self.attempts >= MAX_CAS_ATTEMPTS {
+                if self.attempts >= MAX_FAILURES {
                     return self.done(Outcome::Contended);
                 }
                 self.start_read();
                 return Progress::Waiting;
             }
-            return self.done(Outcome::ProviderError(code.to_owned()));
+            return self.done(Outcome::ProviderError(code.into()));
         }
         match self.phase {
             Phase::Read => self.consume_read(payload),
@@ -261,29 +385,9 @@ impl PendingStoreOperation {
                 if payload.get("revision").and_then(Value::as_u64) != self.write_revision {
                     return self.done(Outcome::Unknown);
                 }
-                match self.write_receipt.take().expect("write receipt").state {
-                    ReceiptState::Pending => self.done(Outcome::Begun),
-                    ReceiptState::Completed { .. } => {
-                        self.done(Outcome::Completed(self.completed_receipt()))
-                    }
-                }
+                let result = self.write_outcome.take().expect("write outcome");
+                self.done(result)
             }
-        }
-    }
-    fn completed_receipt(&self) -> Receipt {
-        match &self.operation {
-            Operation::Complete {
-                operation_id,
-                request,
-                result,
-            } => Receipt {
-                operation_id: operation_id.clone(),
-                request: request.clone(),
-                state: ReceiptState::Completed {
-                    result: result.clone(),
-                },
-            },
-            _ => unreachable!("completion requires complete operation"),
         }
     }
     fn consume_read(&mut self, payload: Value) -> Progress {
@@ -296,13 +400,25 @@ impl PendingStoreOperation {
         let Some(found) = payload.get("found").and_then(Value::as_bool) else {
             return self.done(Outcome::Unknown);
         };
-        let metadata = &payload["metadata"];
-        if found != (revision != 0)
-            || (found && metadata != &json!({"format_version":1}))
-            || (!found && (!metadata.is_null() || revision != 0 || count != 0))
-            || count > MAX_RECEIPTS
-        {
+        if found != (revision != 0) {
             return self.done(Outcome::Unknown);
+        }
+        let mut meta = if !found {
+            if count != 0 || !payload["metadata"].is_null() {
+                return self.done(Outcome::Unknown);
+            }
+            Metadata::empty(self.operation.epoch().to_owned())
+        } else {
+            let Ok(meta) = serde_json::from_value::<Metadata>(payload["metadata"].clone()) else {
+                return self.done(Outcome::Unknown);
+            };
+            meta
+        };
+        if !meta.validate(count) {
+            return self.done(Outcome::Unknown);
+        }
+        if meta.epoch != self.operation.epoch() {
+            return self.done(Outcome::EpochMismatch);
         }
         let Some(value) = payload.get("value") else {
             return self.done(Outcome::Unknown);
@@ -313,7 +429,7 @@ impl PendingStoreOperation {
             let Ok(receipt) = serde_json::from_value::<Receipt>(value.clone()) else {
                 return self.done(Outcome::Unknown);
             };
-            if receipt.operation_id != self.operation.id()
+            if !valid_operation_id(&receipt.operation_id)
                 || validate_content(&receipt.request).is_err()
                 || matches!(&receipt.state, ReceiptState::Completed { result } if validate_content(result).is_err())
             {
@@ -321,30 +437,45 @@ impl PendingStoreOperation {
             }
             Some(receipt)
         };
-        if !found && existing.is_some() || (count == 0 && existing.is_some()) {
-            return self.done(Outcome::Unknown);
+        if let Some(sequence) = self.operation.sequence() {
+            if sequence <= meta.low {
+                return self.done(Outcome::Expired);
+            }
+            if sequence <= meta.high && existing.is_none()
+                || sequence > meta.high && existing.is_some()
+            {
+                return self.done(Outcome::Unknown);
+            }
         }
-        let receipt = match (&self.operation, existing) {
+        let mut edits = Vec::new();
+        let outcome = match (&self.operation, existing) {
             (Operation::Lookup { .. }, None) => return self.done(Outcome::NotFound),
             (Operation::Lookup { .. }, Some(r)) => return self.done(receipt_outcome(r)),
-            (
-                Operation::Begin {
-                    operation_id,
-                    request,
-                },
-                None,
-            ) => {
-                if count >= MAX_RECEIPTS {
+            (Operation::Begin { sequence, .. }, None) => {
+                if meta.high.checked_add(1) != Some(*sequence) {
+                    return self.done(Outcome::SequenceWindow);
+                }
+                if meta.pending != 0 {
+                    return self.done(Outcome::SequenceWindow);
+                }
+                if count >= WINDOW {
                     return self.done(Outcome::Capacity);
                 }
-                Receipt {
-                    operation_id: operation_id.clone(),
-                    request: request.clone(),
-                    state: ReceiptState::Pending,
-                }
+                meta.high = *sequence;
+                meta.pending += 1;
+                let receipt = self.operation.receipt(ReceiptState::Pending);
+                edits.push(json!({"key":self.operation.key(),"value":receipt}));
+                Outcome::Begun
             }
-            (Operation::Begin { request, .. }, Some(r)) => {
-                return if r.request != *request {
+            (
+                Operation::Begin {
+                    request,
+                    operation_id,
+                    ..
+                },
+                Some(r),
+            ) => {
+                return if r.request != *request || r.operation_id != *operation_id {
                     self.done(Outcome::Conflict)
                 } else {
                     self.done(receipt_outcome(r))
@@ -353,11 +484,14 @@ impl PendingStoreOperation {
             (Operation::Complete { .. }, None) => return self.done(Outcome::NotFound),
             (
                 Operation::Complete {
-                    request, result, ..
+                    request,
+                    result,
+                    operation_id,
+                    ..
                 },
                 Some(r),
             ) => {
-                if r.request != *request {
+                if r.request != *request || r.operation_id != *operation_id {
                     return self.done(Outcome::Conflict);
                 }
                 if let ReceiptState::Completed { result: previous } = &r.state {
@@ -367,17 +501,39 @@ impl PendingStoreOperation {
                         self.done(Outcome::Conflict)
                     };
                 }
-                self.completed_receipt()
+                if meta.pending == 0 {
+                    return self.done(Outcome::Unknown);
+                }
+                meta.pending -= 1;
+                let receipt = self.operation.receipt(ReceiptState::Completed {
+                    result: result.clone(),
+                });
+                edits.push(json!({"key":self.operation.key(),"value":receipt}));
+                Outcome::Completed(receipt)
+            }
+            (Operation::Retire { sequence, .. }, Some(r)) => {
+                if meta.low.checked_add(1) != Some(*sequence) {
+                    return self.done(Outcome::SequenceWindow);
+                }
+                if matches!(r.state, ReceiptState::Pending) {
+                    return self.done(Outcome::RecoveryRequired(r));
+                }
+                meta.low = *sequence;
+                edits.push(json!({"key":self.operation.key(),"value":null}));
+                Outcome::Retired
+            }
+            (Operation::Retire { .. }, None) => return self.done(Outcome::NotFound),
+            (Operation::Rollover { authorization }, _) => {
+                meta.epoch = authorization.new.0.clone();
+                Outcome::RolledOver
             }
         };
-        let value = serde_json::to_value(&receipt).expect("receipt serializes");
-        let body = json!({"action":"collection_commit","collection":COLLECTION,"expected_revision":revision,"metadata":{"format_version":1},"edits":[{"key":self.operation.id(),"value":value}]});
-        let Some(next_revision) = revision.checked_add(1) else {
+        let Some(next) = revision.checked_add(1) else {
             return self.done(Outcome::Unknown);
         };
-        self.write_revision = Some(next_revision);
-        self.write_receipt = Some(receipt);
-        self.set_exchange(body, "write");
+        self.write_revision = Some(next);
+        self.write_outcome = Some(outcome);
+        self.set_exchange(json!({"action":"collection_commit","collection":COLLECTION,"expected_revision":revision,"metadata":meta,"edits":edits}), "write");
         self.phase = Phase::Write;
         Progress::Waiting
     }
@@ -400,13 +556,7 @@ fn valid_id(value: &str, max: usize) -> bool {
         })
 }
 fn valid_operation_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 96
-        && value.bytes().all(|b| {
-            b.is_ascii_lowercase()
-                || b.is_ascii_digit()
-                || matches!(b, b'.' | b'_' | b'-' | b'/' | b':')
-        })
+    !value.is_empty() && value.len() <= 128 && value.bytes().all(|b| b.is_ascii_graphic())
 }
 fn validate_content(value: &Value) -> Result<(), &'static str> {
     if serde_json::to_vec(value).is_ok_and(|v| v.len() <= MAX_CONTENT_BYTES) {
@@ -419,174 +569,194 @@ fn validate_content(value: &Value) -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
+    use std::collections::BTreeMap;
 
-    fn begin() -> Operation {
+    fn epoch(name: &str) -> VerifiedEpoch {
+        VerifiedEpoch::authenticate(name.into(), |_| true).unwrap()
+    }
+    fn begin(epoch: &str, sequence: u64) -> Operation {
         Operation::Begin {
-            operation_id: "operation.1".into(),
-            request: json!({"mode":"1920x1080"}),
+            epoch: self::epoch(epoch),
+            sequence,
+            operation_id: format!("caller:{sequence}"),
+            request: json!({"sequence":sequence}),
         }
     }
-    fn entry(state: ReceiptState) -> Value {
-        serde_json::to_value(Receipt {
-            operation_id: "operation.1".into(),
-            request: json!({"mode":"1920x1080"}),
-            state,
-        })
-        .unwrap()
-    }
-    fn read(revision: u64, value: Value) -> Value {
-        json!({"ok":true,"revision":revision,"found":revision != 0,"metadata":if revision == 0 { Value::Null } else { json!({"format_version":1}) },"count":if value.is_null() { 0 } else { 1 },"value":value})
-    }
-    fn sequence(payloads: Vec<Value>) -> VecDeque<ModuleResult<Response>> {
-        let mut all = VecDeque::new();
-        for (index, payload) in payloads.into_iter().enumerate() {
-            all.push_back(Ok(Response::Accepted {
-                id: index as u64 + 1,
-            }));
-            all.push_back(Ok(Response::Result { payload }));
-            all.push_back(Ok(Response::Ok));
+    fn complete(epoch: &str, sequence: u64) -> Operation {
+        Operation::Complete {
+            epoch: self::epoch(epoch),
+            sequence,
+            operation_id: format!("caller:{sequence}"),
+            request: json!({"sequence":sequence}),
+            result: json!({"settled":true}),
         }
-        all
     }
-    fn run(operation: Operation, payloads: Vec<Value>) -> (Outcome, Vec<Command>) {
-        let mut call =
-            PendingStoreOperation::new(operation, "receipt.test".into(), Some(99), 30000, 0)
-                .unwrap();
-        let mut replies = sequence(payloads);
-        let mut commands = Vec::new();
-        for tick in 0..50 {
-            let progress = call.poll(tick, &mut |command| {
-                commands.push(command);
-                replies.pop_front().expect("unexpected request")
-            });
-            if let Progress::Done(outcome) = progress {
-                return (outcome, commands);
+    fn lookup(epoch: &str, sequence: u64) -> Operation {
+        Operation::Lookup {
+            epoch: self::epoch(epoch),
+            sequence,
+        }
+    }
+    fn retire(epoch: &str, sequence: u64) -> Operation {
+        Operation::Retire {
+            epoch: self::epoch(epoch),
+            sequence,
+        }
+    }
+    #[derive(Default)]
+    struct FakeState {
+        revision: u64,
+        metadata: Value,
+        entries: BTreeMap<String, Value>,
+        pending: Option<Value>,
+        next_id: u64,
+        cas_conflicts: usize,
+    }
+    impl FakeState {
+        fn send(&mut self, command: Command) -> ModuleResult<Response> {
+            match command {
+                Command::Request { payload, .. } => {
+                    let reply = match payload["action"].as_str().unwrap() {
+                        "collection_get" => {
+                            json!({"ok":true,"revision":self.revision,"found":self.revision != 0,"metadata":self.metadata,"count":self.entries.len(),"value":self.entries.get(payload["key"].as_str().unwrap())})
+                        }
+                        "collection_commit" => {
+                            if self.cas_conflicts > 0 {
+                                self.cas_conflicts -= 1;
+                                json!({"ok":false,"error":{"code":"revision_conflict"}})
+                            } else if payload["expected_revision"].as_u64() != Some(self.revision) {
+                                json!({"ok":false,"error":{"code":"revision_conflict"}})
+                            } else {
+                                for edit in payload["edits"].as_array().unwrap() {
+                                    let key = edit["key"].as_str().unwrap().to_owned();
+                                    if edit["value"].is_null() {
+                                        self.entries.remove(&key);
+                                    } else {
+                                        self.entries.insert(key, edit["value"].clone());
+                                    }
+                                }
+                                self.metadata = payload["metadata"].clone();
+                                self.revision += 1;
+                                json!({"ok":true,"revision":self.revision})
+                            }
+                        }
+                        _ => panic!("unknown state operation"),
+                    };
+                    self.pending = Some(reply);
+                    self.next_id += 1;
+                    Ok(Response::Accepted { id: self.next_id })
+                }
+                Command::TakeResult { .. } => Ok(Response::Result {
+                    payload: self.pending.clone().unwrap(),
+                }),
+                Command::ReleaseResult { .. } => {
+                    self.pending = None;
+                    Ok(Response::Ok)
+                }
+                _ => panic!("unexpected command"),
             }
         }
-        panic!("did not complete");
-    }
-
-    #[test]
-    fn begin_requires_confirmed_cas_and_uses_collection_revision() {
-        let (outcome, commands) = run(
-            begin(),
-            vec![read(0, Value::Null), json!({"ok":true,"revision":1})],
-        );
-        assert_eq!(outcome, Outcome::Begun);
-        match &commands[3] {
-            Command::Request {
-                service,
-                payload,
-                parent,
-                ..
-            } => {
-                assert_eq!(service, SERVICE);
-                assert_eq!(*parent, Some(99));
-                assert_eq!(payload["action"], "collection_commit");
-                assert_eq!(payload["expected_revision"], 0);
-                assert_eq!(payload["edits"][0]["value"]["state"]["state"], "pending");
+        fn run(&mut self, op: Operation) -> Outcome {
+            let mut call =
+                PendingStoreOperation::new(op, format!("fake.{}", self.revision), None, 30000, 0)
+                    .unwrap();
+            for tick in 0..50 {
+                if let Progress::Done(outcome) = call.poll(tick, &mut |command| self.send(command))
+                {
+                    return outcome;
+                }
             }
-            _ => panic!("expected commit"),
+            panic!("operation did not complete")
         }
     }
     #[test]
-    fn pending_after_restart_never_authorizes_reexecution_and_changed_payload_conflicts() {
-        let (outcome, commands) = run(begin(), vec![read(1, entry(ReceiptState::Pending))]);
-        assert!(matches!(outcome, Outcome::RecoveryRequired(_)));
-        assert_eq!(commands.len(), 3);
-        let changed = Operation::Begin {
-            operation_id: "operation.1".into(),
-            request: json!({"different":true}),
-        };
-        assert_eq!(
-            run(changed, vec![read(1, entry(ReceiptState::Pending))]).0,
-            Outcome::Conflict
-        );
+    fn more_than_window_operations_can_retire_without_replay() {
+        let mut state = FakeState::default();
+        for sequence in 1..=100 {
+            assert_eq!(state.run(begin("epoch-a", sequence)), Outcome::Begun);
+            assert!(matches!(
+                state.run(complete("epoch-a", sequence)),
+                Outcome::Completed(_)
+            ));
+            assert_eq!(state.run(retire("epoch-a", sequence)), Outcome::Retired);
+        }
+        assert_eq!(state.run(begin("epoch-a", 1)), Outcome::Expired);
+        assert_eq!(state.run(lookup("epoch-a", 100)), Outcome::Expired);
+        assert_eq!(state.metadata["low"], 100);
+        assert_eq!(state.metadata["high"], 100);
     }
     #[test]
-    fn completion_and_duplicate_completion_use_immutable_result() {
-        let op = || Operation::Complete {
-            operation_id: "operation.1".into(),
-            request: json!({"mode":"1920x1080"}),
-            result: json!({"ok":true}),
-        };
-        let (outcome, commands) = run(
-            op(),
-            vec![
-                read(3, entry(ReceiptState::Pending)),
-                json!({"ok":true,"revision":4}),
-            ],
-        );
-        assert!(matches!(outcome, Outcome::Completed(_)));
-        assert!(
-            matches!(&commands[3], Command::Request { payload, .. } if payload["expected_revision"] == 3)
-        );
-        let completed = entry(ReceiptState::Completed {
-            result: json!({"ok":true}),
-        });
+    fn pending_blocks_new_sequence_retirement_and_changed_retry() {
+        let mut state = FakeState::default();
+        assert_eq!(state.run(begin("epoch-a", 1)), Outcome::Begun);
         assert!(matches!(
-            run(op(), vec![read(4, completed.clone())]).0,
+            state.run(begin("epoch-a", 1)),
+            Outcome::RecoveryRequired(_)
+        ));
+        assert_eq!(state.run(begin("epoch-a", 2)), Outcome::SequenceWindow);
+        assert!(matches!(
+            state.run(retire("epoch-a", 1)),
+            Outcome::RecoveryRequired(_)
+        ));
+        let changed = Operation::Begin {
+            epoch: epoch("epoch-a"),
+            sequence: 1,
+            operation_id: "other".into(),
+            request: json!({"sequence":1}),
+        };
+        assert_eq!(state.run(changed), Outcome::Conflict);
+        assert!(matches!(
+            state.run(complete("epoch-a", 1)),
             Outcome::Completed(_)
         ));
-        let different = Operation::Complete {
-            operation_id: "operation.1".into(),
-            request: json!({"mode":"1920x1080"}),
-            result: json!({"ok":false}),
-        };
-        assert_eq!(
-            run(different, vec![read(4, completed)]).0,
-            Outcome::Conflict
-        );
+        assert!(matches!(
+            state.run(complete("epoch-a", 1)),
+            Outcome::Completed(_)
+        ));
     }
     #[test]
-    fn cas_contention_rereads_and_discovers_existing_receipt() {
-        let conflict =
-            json!({"ok":false,"error":{"code":"revision_conflict","current_revision":1}});
-        let (outcome, commands) = run(
-            begin(),
-            vec![
-                read(0, Value::Null),
-                conflict,
-                read(1, entry(ReceiptState::Pending)),
-            ],
+    fn authenticated_epoch_switch_keeps_sequence_and_pending_recovery() {
+        let mut state = FakeState::default();
+        assert_eq!(state.run(begin("epoch-a", 1)), Outcome::Begun);
+        let auth =
+            RolloverAuthorization::authenticate("epoch-a".into(), epoch("epoch-b"), |old, new| {
+                old == "epoch-a" && new == "epoch-b"
+            })
+            .unwrap();
+        assert_eq!(
+            state.run(Operation::Rollover {
+                authorization: auth
+            }),
+            Outcome::RolledOver
         );
-        assert!(matches!(outcome, Outcome::RecoveryRequired(_)));
+        assert_eq!(state.run(begin("epoch-a", 2)), Outcome::EpochMismatch);
+        assert_eq!(state.run(begin("epoch-b", 2)), Outcome::SequenceWindow);
+        assert!(matches!(
+            state.run(complete("epoch-b", 1)),
+            Outcome::Completed(_)
+        ));
+        assert_eq!(state.run(retire("epoch-b", 1)), Outcome::Retired);
+        assert_eq!(state.run(begin("epoch-b", 1)), Outcome::Expired);
+        assert_eq!(state.run(begin("epoch-b", 2)), Outcome::Begun);
+        assert!(VerifiedEpoch::authenticate("epoch-c".into(), |_| false).is_err());
         assert!(
-            matches!(&commands[6], Command::Request { operation_id, .. } if operation_id == "receipt.test.read.1")
+            RolloverAuthorization::authenticate("epoch-b".into(), epoch("epoch-c"), |_, _| false)
+                .is_err()
         );
     }
     #[test]
-    fn full_store_and_unknown_commit_are_not_success() {
-        let full = json!({"ok":true,"revision":5,"found":true,"metadata":{"format_version":1},"count":64,"value":null});
-        assert_eq!(run(begin(), vec![full]).0, Outcome::Capacity);
+    fn cas_contention_and_uncertain_write_remain_explicit() {
+        let mut state = FakeState {
+            cas_conflicts: 3,
+            ..Default::default()
+        };
+        assert_eq!(state.run(begin("epoch-a", 1)), Outcome::Contended);
         let mut call =
-            PendingStoreOperation::new(begin(), "receipt.uncertain".into(), None, 10, 0).unwrap();
-        let mut replies = sequence(vec![read(0, Value::Null)]);
-        for tick in 0..3 {
-            assert_eq!(
-                call.poll(tick, &mut |_| replies.pop_front().unwrap()),
-                Progress::Waiting
-            );
-        }
+            PendingStoreOperation::new(begin("epoch-a", 1), "test".into(), None, 5, 0).unwrap();
+        assert_eq!(call.poll(0, &mut |_| Err("lost".into())), Progress::Waiting);
         assert_eq!(
-            call.poll(3, &mut |_| Ok(Response::Accepted { id: 41 })),
-            Progress::Waiting
-        );
-        assert_eq!(
-            call.poll(10, &mut |_| unreachable!()),
+            call.poll(5, &mut |_| unreachable!()),
             Progress::Done(Outcome::Unknown)
         );
-        assert_eq!(call.request_id(), Some(41));
-    }
-    #[test]
-    fn invalid_metadata_and_oversized_values_are_rejected() {
-        let bad = json!({"ok":true,"revision":1,"found":true,"metadata":{"format_version":2},"count":0,"value":null});
-        assert_eq!(run(begin(), vec![bad]).0, Outcome::Unknown);
-        let oversized = Operation::Begin {
-            operation_id: "id".into(),
-            request: json!("x".repeat(5000)),
-        };
-        assert!(PendingStoreOperation::new(oversized, "prefix".into(), None, 1000, 0).is_err());
     }
 }

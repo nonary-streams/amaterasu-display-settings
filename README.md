@@ -24,10 +24,10 @@ No private Amaterasu Rust crates are imported directly.
 No local build or unit test modifies displays. Tests do not establish that native
 mode setting, recovery, capture binding, or either platform works on hardware.
 
-The receipt-store client retains at most 64 operation records and fails closed
-at capacity. Safe retirement needs a coordinator-authorized epoch and replay
-watermark; the store must not be used for production lifecycle effects until
-that contract and recovery integration are available.
+The receipt-store client retains a bounded receipt window and a durable sequence
+watermark. Its coordinator epoch authentication, rollover fencing, and separate
+active cleanup-obligation journal are not wired, so it must not yet be used to
+authorize production lifecycle effects.
 
 `examples/component-linux.json` is a component-manifest template for an
 isolated settings-validation smoke test; the packager replaces its hash and
