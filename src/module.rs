@@ -977,6 +977,9 @@ fn advance_phase(
                     store,
                 }),
                 LoadProgress::Found(prior) => {
+                    if prior != *expected {
+                        return Err(recovery("release_journal_changed"));
+                    }
                     let cleanup =
                         prior_virtual_cleanup(&prior, &plans, &obligations).map_err(recovery)?;
                     let mut matching = domains
