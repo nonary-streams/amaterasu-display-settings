@@ -111,6 +111,10 @@ pub struct RecoveryObligation {
     pub operation_id: String,
     pub configuration: Configuration,
     pub topology_revision: String,
+    #[serde(default)]
+    pub mutation_domain_id: Option<String>,
+    #[serde(default)]
+    pub mutation_domain_revision: Option<u64>,
     pub lease: Option<String>,
     pub restored: bool,
 }
@@ -129,12 +133,27 @@ impl RecoveryObligation {
             operation_id,
             configuration,
             topology_revision,
+            mutation_domain_id: None,
+            mutation_domain_revision: None,
             lease: None,
             restored: false,
         })
     }
+    pub fn with_domain(mut self, id: String, revision: u64) -> Result<Self, &'static str> {
+        if !valid_domain(&id) {
+            return Err("invalid_mutation_domain");
+        }
+        self.mutation_domain_id = Some(id);
+        self.mutation_domain_revision = Some(revision);
+        Ok(self)
+    }
     fn validate(&self) -> Result<(), &'static str> {
-        if !valid_id(&self.operation_id)
+        if self.mutation_domain_id.is_some() != self.mutation_domain_revision.is_some()
+            || self
+                .mutation_domain_id
+                .as_deref()
+                .is_some_and(|id| !valid_domain(id))
+            || !valid_id(&self.operation_id)
             || !valid_revision(&self.topology_revision)
             || self.lease.as_deref().is_some_and(|v| !valid_lease(v))
             || (self.restored && self.lease.is_none())
@@ -164,9 +183,14 @@ impl Request {
                 if o.lease.is_some() || o.restored {
                     return Err("invalid_obligation");
                 }
-                Ok(
-                    json!({"action":"apply","configuration":o.configuration,"expected_topology_revision":o.topology_revision,"operation_id":o.operation_id}),
-                )
+                let mut payload = json!({"action":"apply","configuration":o.configuration,"expected_topology_revision":o.topology_revision,"operation_id":o.operation_id});
+                if let (Some(id), Some(revision)) =
+                    (&o.mutation_domain_id, o.mutation_domain_revision)
+                {
+                    payload["expected_mutation_domain_id"] = json!(id);
+                    payload["expected_mutation_domain_revision"] = json!(revision);
+                }
+                Ok(payload)
             }
             Self::Restore(o) | Self::Recover(o) => {
                 o.validate()?;
@@ -363,6 +387,9 @@ fn valid_id(value: &str) -> bool {
         && value.bytes().all(|b| {
             b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-' | b'/')
         })
+}
+fn valid_domain(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && value.bytes().all(|byte| byte.is_ascii_graphic())
 }
 fn valid_lease(value: &str) -> bool {
     !value.is_empty() && value.len() <= 256 && value.bytes().all(|b| b.is_ascii_graphic())
@@ -693,5 +720,20 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn physical_apply_forwards_the_exact_admitted_domain_pair() {
+        let obligation = obligation()
+            .with_domain("physical_provider_session:abc".into(), 42)
+            .unwrap();
+        let payload = Request::Apply(obligation).payload().unwrap();
+        assert_eq!(
+            payload["expected_mutation_domain_id"],
+            "physical_provider_session:abc"
+        );
+        assert_eq!(payload["expected_mutation_domain_revision"], 42);
+        let mut missing = super::tests::obligation();
+        missing.mutation_domain_id = Some("physical_provider_session:abc".into());
+        assert!(Request::Apply(missing).payload().is_err());
     }
 }

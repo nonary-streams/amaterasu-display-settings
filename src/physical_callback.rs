@@ -16,6 +16,8 @@ struct PhysicalConstraint {
     provider: String,
     configuration: Configuration,
     expected_topology_revision: String,
+    expected_mutation_domain_id: String,
+    expected_mutation_domain_revision: u64,
 }
 
 /// Commands must be durably and idempotently processed by the integration's
@@ -154,6 +156,13 @@ impl PhysicalCallback {
         {
             return Err("invalid_physical_constraint");
         }
+        if !plan.mutation_domains.iter().any(|domain| {
+            domain.domain == physical.expected_mutation_domain_id
+                && domain.expected_revision == physical.expected_mutation_domain_revision
+                && domain.access == ResourceAccess::Exclusive
+        }) {
+            return Err("physical_domain_not_admitted");
+        }
         // A complete topology can only touch displays explicitly admitted as
         // exclusive resources in the coordinator's execution domain.
         if physical.configuration.displays.len() != plan.resources.len()
@@ -186,10 +195,18 @@ impl PhysicalCallback {
                 physical.configuration,
                 physical.expected_topology_revision,
             )?
+            .with_domain(
+                physical.expected_mutation_domain_id,
+                physical.expected_mutation_domain_revision,
+            )?
         } else {
             let prior = prior.ok_or("missing_prior_obligation")?;
             if prior.configuration != physical.configuration
                 || prior.topology_revision != physical.expected_topology_revision
+                || prior.mutation_domain_id.as_deref()
+                    != Some(physical.expected_mutation_domain_id.as_str())
+                || prior.mutation_domain_revision
+                    != Some(physical.expected_mutation_domain_revision)
                 || prior.lease.is_none()
                 || prior.restored
             {
@@ -417,7 +434,7 @@ mod tests {
             "consumer_requirements":{"execution_domain":"desktop","capture_providers":["capture"],"selector_schemas":["selector"]},
             "remaining_ms":5000,"plan_revision":1,"admission_id":"admission-1",
             "approved_plan":{"plan_id":"plan-1","revision":1,"resources":[{"provider":"nonary.display-settings","resource_id":"display-1","incarnation":null,"expected_revision":null,"execution_domain":"desktop","mutation_domains":[],"access":"exclusive"}],
-            "mutation_domains":[],"required_capabilities":[],"constraints":{"physical":{"provider":"amaterasu.display/1","configuration":{"displays":[{"id":"display-1","width":1920,"height":1080,"refresh":{"numerator":60,"denominator":1},"x":0,"y":0}]},"expected_topology_revision":"0123456789abcdef0123456789abcdef"}},"obligations":[],"affected_consumers":[],"consumer_change":"reconnect_required","candidate_constraint":null,"allowed_degradation":[]}
+            "mutation_domains":[{"domain":"physical_provider_session:abc","expected_revision":2,"borrowers":{},"access":"exclusive"}],"required_capabilities":[],"constraints":{"physical":{"expected_mutation_domain_id":"physical_provider_session:abc","expected_mutation_domain_revision":2,"provider":"amaterasu.display/1","configuration":{"displays":[{"id":"display-1","width":1920,"height":1080,"refresh":{"numerator":60,"denominator":1},"x":0,"y":0}]},"expected_topology_revision":"0123456789abcdef0123456789abcdef"}},"obligations":[],"affected_consumers":[],"consumer_change":"reconnect_required","candidate_constraint":null,"allowed_degradation":[]}
         })).unwrap()
     }
     struct AllowGuard;
@@ -649,6 +666,11 @@ mod tests {
             "operation-1".into(),
             constraint.configuration,
             constraint.expected_topology_revision,
+        )
+        .unwrap()
+        .with_domain(
+            constraint.expected_mutation_domain_id,
+            constraint.expected_mutation_domain_revision,
         )
         .unwrap();
         obligation.lease = Some("lease-1".into());
