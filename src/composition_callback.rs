@@ -129,7 +129,7 @@ pub fn composition_callback(request: &ProviderRequest) -> Result<ProviderRespons
                     .get("native_state")
                     .and_then(|v| v.as_str())
                     != Some("active")
-                || !matches_requested_mode(&proposal.arguments, &result.output.data)
+                || !matches_requested_mode(&proposal.arguments, &input.data, &result.output.data)
             {
                 return Err("configuration_not_confirmed");
             }
@@ -194,7 +194,11 @@ fn same_resource_output(input: &ResourceOutput, result: &ResourceOutput) -> bool
         })
 }
 
-fn matches_requested_mode(arguments: &serde_json::Value, output: &serde_json::Value) -> bool {
+fn matches_requested_mode(
+    arguments: &serde_json::Value,
+    input: &serde_json::Value,
+    output: &serde_json::Value,
+) -> bool {
     let Some(mode) = output.get("mode") else {
         return false;
     };
@@ -209,13 +213,21 @@ fn matches_requested_mode(arguments: &serde_json::Value, output: &serde_json::Va
         }
     }
     let hdr_matches = match arguments.get("hdr").and_then(|v| v.as_str()) {
-        Some("preserve") => true,
+        Some("preserve") => input
+            .pointer("/mode/hdr")
+            .and_then(|v| v.as_bool())
+            .is_some_and(|prior| mode.get("hdr").and_then(|v| v.as_bool()) == Some(prior)),
         Some("on") => mode.get("hdr").and_then(|v| v.as_bool()) == Some(true),
         Some("off") => mode.get("hdr").and_then(|v| v.as_bool()) == Some(false),
         _ => false,
     };
     let scaling_matches = match arguments.pointer("/scaling/mode").and_then(|v| v.as_str()) {
-        Some("preserve") => true,
+        Some("preserve") => input
+            .get("scale_percent")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|prior| {
+                output.get("scale_percent").and_then(|v| v.as_u64()) == Some(prior)
+            }),
         Some("percent") => arguments
             .pointer("/scaling/percent")
             .and_then(|v| v.as_u64())
@@ -225,7 +237,10 @@ fn matches_requested_mode(arguments: &serde_json::Value, output: &serde_json::Va
         _ => false,
     };
     let layout_matches = match arguments.get("layout").and_then(|v| v.as_str()) {
-        Some("preserve") => true,
+        Some("preserve") => input
+            .get("layout")
+            .and_then(|v| v.as_str())
+            .is_some_and(|prior| output.get("layout").and_then(|v| v.as_str()) == Some(prior)),
         Some(layout) => output.get("layout").and_then(|v| v.as_str()) == Some(layout),
         _ => false,
     };
@@ -279,15 +294,45 @@ mod tests {
     fn requested_changes_require_observed_values() {
         let arguments = json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":"off","scaling":{"mode":"percent","percent":150},"layout":"extended"});
         let mut output = json!({"mode":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false},"scale_percent":150,"layout":"extended"});
-        assert!(matches_requested_mode(&arguments, &output));
+        let input = output.clone();
+        assert!(matches_requested_mode(&arguments, &input, &output));
         output["scale_percent"] = serde_json::Value::Null;
-        assert!(!matches_requested_mode(&arguments, &output));
+        assert!(!matches_requested_mode(&arguments, &input, &output));
         output["scale_percent"] = json!(150);
         output["mode"]["hdr"] = serde_json::Value::Null;
-        assert!(!matches_requested_mode(&arguments, &output));
+        assert!(!matches_requested_mode(&arguments, &input, &output));
         output["mode"]["hdr"] = json!(false);
         output["layout"] = json!("exclusive");
-        assert!(!matches_requested_mode(&arguments, &output));
+        assert!(!matches_requested_mode(&arguments, &input, &output));
+    }
+
+    #[test]
+    fn preserved_values_must_be_observed_unchanged() {
+        let mut request = fixture();
+        request.approved_plan.as_mut().unwrap().control_proposals[0].arguments = json!({"operation":"configure","width":1920,"height":1080,"refresh_millihz":60000,"hdr":"preserve","scaling":{"mode":"preserve"},"layout":"preserve"});
+        assert!(composition_callback(&request).is_ok());
+        for (field, changed) in [
+            ("hdr", json!(true)),
+            ("scale_percent", json!(200)),
+            ("layout", json!("exclusive")),
+        ] {
+            let mut altered = request.clone();
+            if field == "hdr" {
+                altered.control_results[0].output.data["mode"][field] = changed;
+            } else {
+                altered.control_results[0].output.data[field] = changed;
+            }
+            assert_eq!(
+                composition_callback(&altered),
+                Err("configuration_not_confirmed")
+            );
+        }
+        request.dependency_inputs[0].data["scale_percent"] = serde_json::Value::Null;
+        request.control_results[0].output.data["scale_percent"] = serde_json::Value::Null;
+        assert_eq!(
+            composition_callback(&request),
+            Err("configuration_not_confirmed")
+        );
     }
 
     #[test]

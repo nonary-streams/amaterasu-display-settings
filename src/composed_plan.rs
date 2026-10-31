@@ -244,6 +244,11 @@ fn composed_configure(
     {
         return Err("display_policy_unsupported");
     }
+    if data["scale_percent"].as_u64().is_none()
+        || (settings.layout == LayoutSetting::Preserve && data["layout"].as_str().is_none())
+    {
+        return Err("preserved_state_unavailable");
+    }
     let observed = &data["mode"];
     let client = request.requested_video.as_ref();
     let width = match settings.resolution {
@@ -320,7 +325,7 @@ mod tests {
             "resource":{"provider":"example.owner","resource_id":"output-1","incarnation":"inc-1","revision":3,"execution_domain":"desktop","mutation_domain":"domain-1","mutation_domains":["domain-1"]},
             "data":{"kind":"virtual","physical_identity":null,"primary":null,"desired_activation":"active","native_state":"active","retention_state":"active","control_state":"unconfigured","snapshot_id":null,
                 "mode":{"width":1600,"height":900,"refresh_millihz":60000,"hdr":false},
-                "capture_selector":{"provider":CAPTURE,"schema":SELECTOR,"selector":{}},"scale_percent":null,"layout":null}
+                "capture_selector":{"provider":CAPTURE,"schema":SELECTOR,"selector":{}},"scale_percent":100,"layout":"extended"}
         }]);
         serde_json::from_value(value).unwrap()
     }
@@ -380,6 +385,9 @@ mod tests {
         request.dependency_inputs[0].data["mode"]["hdr"] = Value::Null;
         assert_eq!(plan_composed(&request), Err("display_policy_unsupported"));
         request.dependency_inputs[0].data["mode"]["hdr"] = json!(false);
+        request.dependency_inputs[0].data["scale_percent"] = Value::Null;
+        assert_eq!(plan_composed(&request), Err("preserved_state_unavailable"));
+        request.dependency_inputs[0].data["scale_percent"] = json!(100);
         request.dependency_inputs[0].domain_observations[0].domain = "other".into();
         assert_eq!(plan_composed(&request), Err("invalid_request"));
     }
