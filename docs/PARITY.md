@@ -10,7 +10,11 @@ allocate or retain virtual screens and does not advertise the former remove-owne
 action. A compatible v2 producer can supply a physical or virtual target; a physical
 producer and end-to-end platform qualification remain outstanding. Linux and Windows
 native mode, capture, restore, HDR, scaling and compositor behavior require live
-validation. The composition path and migration tooling are still being integrated.
+validation. Simulated composed-lifecycle tests are not native or end-to-end
+streaming qualification: the latest simulated run passed initial stream, pause
+and restore, but first resume failed in owner recovery. The Core repository
+provides a non-mutating split export planner; applying and validating an upgrade
+remains an operator task.
 
 The settings participant configures and restores per stream; session phases do
 not mutate the target. It compares known preserved HDR, scale and layout values,
@@ -20,7 +24,9 @@ and scale and selected virtual layouts; unsupported requests fail closed. The na
 source and fake-backend test coverage, not live KScreen or hardware qualification.
 There is no v2 physical target producer yet. Revision-1 combined settings and
 owned resources require explicit export, review and retirement before a fresh
-profile is enabled; no automatic migration or lease adoption is performed.
+profile is enabled; no automatic migration or lease adoption is performed. The
+split export has been tested with legacy and display-v2 descriptors and a draft
+owner descriptor, but not the latest owner descriptor or a live registry import.
 
 ## Historical baseline: public services and ownership
 

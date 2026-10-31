@@ -33,7 +33,10 @@ mode setting, recovery, capture binding, or either platform works on hardware.
 The composed planner accepts physical targets from a compatible v2 resource
 producer, but no such physical producer is available yet. Linux and Windows
 native behavior and complete streaming still require integration and hardware
-qualification. Unknown operations remain fenced for coordinator reconciliation.
+qualification. In a simulated integration run, initial stream, pause and restore
+passed, but the first resume failed in owner recovery; this is not a complete
+composed-stream qualification. Unknown operations remain fenced for coordinator
+reconciliation.
 
 `examples/component-linux.json` is a component-manifest template; the packager
 replaces its hash and size. `examples/lifecycle-api-approvals.json` shows the
@@ -50,4 +53,12 @@ automatically migrated or deleted. Use a fresh profile and an explicit settings
 export/import to split configuration from virtual-screen lifecycle settings.
 Validate both imports before enabling effects. Retire owned resources under the
 old provider first; this extension does not adopt its leases or native journal.
-The export/import tooling and composed lifecycle path are still being integrated.
+The Core repository's `scripts/export_session_extension_split.py` can produce a
+non-mutating, reviewable split plan for a fresh destination. It retains settings
+fields here and maps the four lifecycle fields to virtual-screen; it validates
+candidate values against supplied descriptors and requires an explicit owner
+`enabled` choice. It does not contact the registry, apply imports, validate with
+providers, or migrate an existing state root. It has been exercised with the
+legacy and display-v2 descriptors and a draft owner descriptor; the latest owner
+descriptor and live import still need validation. See the Core repository's
+`docs/session-extensions-local-profile.md` for the procedure and limits.
