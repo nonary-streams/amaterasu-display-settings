@@ -71,6 +71,7 @@ pub fn plan_composed(request: &ProviderRequest) -> Result<ResourcePlan, &'static
             candidate_constraint: None,
             allowed_degradation: vec![],
             control_proposals: vec![],
+            resource_disposition: None,
         });
     }
     let mut inputs = request.dependency_inputs.iter().filter(|input| {
@@ -225,6 +226,7 @@ pub fn plan_composed(request: &ProviderRequest) -> Result<ResourcePlan, &'static
         candidate_constraint: None,
         allowed_degradation: vec![],
         control_proposals: vec![proposal],
+        resource_disposition: None,
     };
     extension_api::validate_resource_plan(&plan).map_err(|_| "invalid_resource_plan")?;
     Ok(plan)
