@@ -1,0 +1,750 @@
+//! Read-only resource planning for the independent display provider.
+//!
+//! A proposed plan does not authorize native effects. The coordinator must
+//! admit it and recheck revisions before dispatching a lifecycle callback.
+use crate::settings::{
+    DisplaySettings, HdrOverrideSetting, LayoutSetting, PhysicalTargetSetting, RefreshSetting,
+    ResolutionSetting, RetentionSetting, ScalingSetting,
+};
+use crate::virtual_callback::VirtualObligation;
+use crate::{descriptor, physical_display, virtual_display};
+use amaterasu_module_sdk::{
+    Command, ModuleResult, Response,
+    extension_api::{
+        self, BindingConstraint, ConsumerChange, LifecycleTarget, MethodRef, MutationDomainPlan,
+        PlannedResource, ProviderOperation, ProviderRequest, ProviderResponse, ResourceAccess,
+        ResourceObligation, ResourcePlan, VideoMode,
+    },
+};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+
+const COORDINATOR: &str = "amaterasu.session-lifecycle";
+const CAPTURE: &str = "amaterasu.capture-pipewire/1";
+const SELECTOR: &str = "amaterasu.kwin-wl-output/1";
+const MAX_FAILURES: u8 = 3;
+
+/// A caller must validate the broker-selected coordinator and planning target;
+/// request fields alone are not authority to select or mutate a desktop.
+pub struct Planner {
+    request: ProviderRequest,
+    selection: Selection,
+    stage: Stage,
+    exchange: Exchange,
+    deadline_ms: u64,
+    failures: u8,
+    finished: Option<PlanProgress>,
+    parent: Option<u64>,
+}
+enum Selection {
+    Virtual {
+        identity: String,
+        reference_id: String,
+        mode: VideoMode,
+        layout: Option<String>,
+    },
+    Physical,
+}
+#[derive(Clone, Copy)]
+enum Stage {
+    VirtualStatus,
+    PhysicalStatus,
+    PhysicalSnapshot,
+}
+struct Exchange {
+    command: Command,
+    id: Option<u64>,
+    result: Option<Value>,
+    uncertain: bool,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub enum PlanProgress {
+    Waiting,
+    Complete(Box<ProviderResponse>),
+    Unknown,
+}
+
+impl Planner {
+    pub fn new(
+        caller: &str,
+        request: ProviderRequest,
+        parent: Option<u64>,
+        now_ms: u64,
+        verify_target: impl FnOnce(&ProviderRequest) -> bool,
+    ) -> Result<Self, &'static str> {
+        if caller != COORDINATOR
+            || request.operation != ProviderOperation::ResourcePlan
+            || extension_api::validate_provider_request(&request).is_err()
+            || !verify_target(&request)
+        {
+            return Err("unauthorized_or_invalid_request");
+        }
+        let settings_value =
+            serde_json::to_value(&request.settings).map_err(|_| "invalid_settings")?;
+        let settings: DisplaySettings =
+            serde_json::from_value(settings_value.clone()).map_err(|_| "invalid_settings")?;
+        if crate::settings_schema::validate(&request.settings).is_err()
+            || settings.to_policy().is_err()
+            || !settings.enabled
+        {
+            return Err("disabled_or_invalid_settings");
+        }
+        let target = settings_value
+            .get("display_target")
+            .and_then(Value::as_str)
+            .unwrap_or("virtual");
+        let timeout = request.remaining_ms.min(30_000);
+        let (stage, selection, payload, service) = match target {
+            "virtual" => {
+                if !cfg!(target_os = "linux") {
+                    return Err("virtual_platform_unsupported");
+                }
+                let (session, reference) = target_ids(&request.target)?;
+                let identity = stable_uuid("display", session);
+                let reference_id = format!("ref-{}", stable_hex("reference", &reference));
+                virtual_display::DisplayReference {
+                    identity: identity.clone(),
+                    reference_id: reference_id.clone(),
+                }
+                .validate()?;
+                if !request
+                    .consumer_requirements
+                    .capture_providers
+                    .iter()
+                    .any(|p| p == CAPTURE)
+                    || !request
+                        .consumer_requirements
+                        .selector_schemas
+                        .iter()
+                        .any(|s| s == SELECTOR)
+                {
+                    return Err("capture_provider_unavailable");
+                }
+                let mode = resolve_mode(&request, &settings)?;
+                if settings.keepalive_while_paused
+                    || settings.enforce_while_paused
+                    || settings.retention != RetentionSetting::UntilSessionEnds
+                {
+                    return Err("retention_policy_unsupported");
+                }
+                if settings.scaling != ScalingSetting::Preserve
+                    || settings.hdr_request_override != HdrOverrideSetting::FollowClient
+                {
+                    return Err("display_policy_unsupported");
+                }
+                let layout = match settings.layout {
+                    LayoutSetting::Preserve => None,
+                    LayoutSetting::Exclusive => Some("exclusive".into()),
+                    LayoutSetting::Extended => Some("extended".into()),
+                    _ => return Err("layout_unsupported"),
+                };
+                let payload =
+                    json!({"action":"status","identity":identity,"reference_id":reference_id});
+                (
+                    Stage::VirtualStatus,
+                    Selection::Virtual {
+                        identity,
+                        reference_id,
+                        mode,
+                        layout,
+                    },
+                    payload,
+                    virtual_display::SERVICE,
+                )
+            }
+            "physical" => {
+                if !cfg!(windows) {
+                    return Err("physical_platform_unsupported");
+                }
+                (
+                    Stage::PhysicalStatus,
+                    Selection::Physical,
+                    json!({"action":"status"}),
+                    physical_display::SERVICE,
+                )
+            }
+            _ => return Err("invalid_display_target"),
+        };
+        let exchange = make_exchange(service, payload, &request, "status", parent, timeout)?;
+        Ok(Self {
+            request,
+            selection,
+            stage,
+            exchange,
+            deadline_ms: now_ms.saturating_add(timeout),
+            failures: 0,
+            finished: None,
+            parent,
+        })
+    }
+    /// Polls at most one broker command. Transport acceptance does not imply
+    /// provider readiness or permission to execute a plan.
+    pub fn poll(
+        &mut self,
+        now_ms: u64,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+    ) -> PlanProgress {
+        if let Some(done) = &self.finished {
+            return done.clone();
+        }
+        if now_ms >= self.deadline_ms || self.failures >= MAX_FAILURES {
+            return self.finish(PlanProgress::Unknown);
+        }
+        if let Some(id) = self.exchange.id {
+            if self.exchange.result.is_some() {
+                match send(Command::ReleaseResult { request: id }) {
+                    Ok(Response::Ok) => {
+                        let value = self.exchange.result.take().expect("result");
+                        self.consume(value, now_ms)
+                    }
+                    _ => {
+                        self.failures += 1;
+                        PlanProgress::Waiting
+                    }
+                }
+            } else {
+                match send(Command::TakeResult { request: id }) {
+                    Ok(Response::Pending) => PlanProgress::Waiting,
+                    Ok(Response::Result { payload }) => {
+                        self.exchange.result = Some(payload);
+                        PlanProgress::Waiting
+                    }
+                    _ => {
+                        self.failures += 1;
+                        PlanProgress::Waiting
+                    }
+                }
+            }
+        } else {
+            match send(self.exchange.command.clone()) {
+                Ok(Response::Accepted { id }) => {
+                    self.exchange.id = Some(id);
+                    self.failures = 0;
+                    PlanProgress::Waiting
+                }
+                Ok(Response::Error { .. }) if !self.exchange.uncertain => {
+                    self.finish(rejected("provider_unavailable"))
+                }
+                _ => {
+                    self.exchange.uncertain = true;
+                    self.failures += 1;
+                    PlanProgress::Waiting
+                }
+            }
+        }
+    }
+    fn consume(&mut self, payload: Value, now_ms: u64) -> PlanProgress {
+        match self.stage {
+            Stage::VirtualStatus => match self.virtual_plan(&payload) {
+                Ok(plan) => self.finish(PlanProgress::Complete(Box::new(
+                    ProviderResponse::Planned { plan },
+                ))),
+                Err(reason) => self.finish(rejected(reason)),
+            },
+            Stage::PhysicalStatus => {
+                if payload.get("ok").and_then(Value::as_bool) != Some(true)
+                    || payload.get("native_supported").and_then(Value::as_bool) != Some(true)
+                    || payload.get("mutation_enabled").and_then(Value::as_bool) != Some(true)
+                    || payload.get("state").and_then(Value::as_str) != Some("idle")
+                {
+                    return self.finish(rejected("physical_provider_unavailable"));
+                }
+                let remaining = self.deadline_ms.saturating_sub(now_ms).min(30_000);
+                match make_exchange(
+                    physical_display::SERVICE,
+                    json!({"action":"snapshot"}),
+                    &self.request,
+                    "snapshot",
+                    self.parent,
+                    remaining,
+                ) {
+                    Ok(exchange) => {
+                        self.exchange = exchange;
+                        self.stage = Stage::PhysicalSnapshot;
+                        self.failures = 0;
+                        PlanProgress::Waiting
+                    }
+                    Err(_) => self.finish(PlanProgress::Unknown),
+                }
+            }
+            Stage::PhysicalSnapshot => {
+                let snapshot: Option<physical_display::Configuration> = payload
+                    .get("configuration")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value(v).ok());
+                let revision = payload.get("topology_revision").and_then(Value::as_str);
+                if payload.get("ok").and_then(Value::as_bool) != Some(true)
+                    || snapshot.as_ref().is_none_or(|s| s.validate().is_err())
+                    || revision.is_none_or(|v| {
+                        v.len() != 32
+                            || !v
+                                .bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    })
+                {
+                    return self.finish(rejected("physical_snapshot_unavailable"));
+                }
+                let Ok(settings) = serde_json::from_value::<DisplaySettings>(
+                    serde_json::to_value(&self.request.settings).expect("settings serialize"),
+                ) else {
+                    return self.finish(rejected("invalid_settings"));
+                };
+                if let Err(reason) =
+                    select_physical(snapshot.as_ref().expect("validated snapshot"), &settings)
+                {
+                    return self.finish(rejected(reason));
+                }
+                // The service has no public mutation-domain borrower identities
+                // or monotonic domain revision. A snapshot hash cannot be used
+                // as that authority without collisions or invented semantics.
+                self.finish(rejected("physical_domain_authority_unavailable"))
+            }
+        }
+    }
+    fn virtual_plan(&self, payload: &Value) -> Result<ResourcePlan, &'static str> {
+        let Selection::Virtual {
+            identity,
+            reference_id,
+            mode,
+            layout,
+        } = &self.selection
+        else {
+            return Err("invalid_selection");
+        };
+        if payload.get("ok").and_then(Value::as_bool) != Some(true)
+            || payload.get("enabled").and_then(Value::as_bool) != Some(true)
+            || payload.get("native_supported").and_then(Value::as_bool) != Some(true)
+            || payload.get("recovery_ready").and_then(Value::as_bool) != Some(true)
+            || payload.get("driver").and_then(Value::as_str) != Some("libvirtualdisplay")
+            || payload.get("ownership_authority").and_then(Value::as_str) != Some("unix_uid_broker")
+        {
+            return Err("virtual_provider_unavailable");
+        }
+        if payload.get("reference_owned").and_then(Value::as_bool) != Some(false)
+            || payload
+                .get("monitors")
+                .and_then(Value::as_array)
+                .is_none_or(|v| !v.is_empty())
+        {
+            return Err("existing_virtual_reference_requires_reconciliation");
+        }
+        let domain = payload
+            .get("mutation_domain")
+            .and_then(Value::as_object)
+            .ok_or("mutation_domain_unavailable")?;
+        let id = domain
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|s| {
+                s.starts_with("provider_session:")
+                    && s.len() <= 128
+                    && s.bytes().all(|b| b.is_ascii_graphic())
+            })
+            .ok_or("invalid_mutation_domain")?;
+        let revision = domain
+            .get("revision")
+            .and_then(Value::as_u64)
+            .ok_or("invalid_mutation_domain")?;
+        if domain.get("scope").and_then(Value::as_str) != Some("provider_session")
+            || domain.get("borrowers").and_then(Value::as_u64) != Some(0)
+            || domain.get("pending_mutations").and_then(Value::as_u64) != Some(0)
+        {
+            return Err("mutation_domain_busy");
+        }
+        let provider_settings = payload
+            .get("settings")
+            .and_then(Value::as_object)
+            .ok_or("provider_settings_unavailable")?;
+        if provider_settings
+            .get("dd_virtual_display_scale")
+            .and_then(Value::as_i64)
+            != Some(0)
+        {
+            return Err("scale_unsupported");
+        }
+        let layout = match layout {
+            Some(value) => value.as_str(),
+            None => provider_settings
+                .get("virtual_display_layout")
+                .and_then(Value::as_str)
+                .ok_or("layout_unavailable")?,
+        };
+        if !matches!(layout, "exclusive" | "extended") {
+            return Err("layout_unsupported");
+        }
+        let plan_revision = self.request.provider_sequence;
+        let selection = VirtualObligation {
+            provider_service: virtual_display::SERVICE.into(),
+            identity: identity.clone(),
+            reference_id: reference_id.clone(),
+            width: mode.width,
+            height: mode.height,
+            refresh_millihz: mode.refresh_millihz,
+            name: "Amaterasu".into(),
+            hdr_enabled: false,
+            scale: Some(0),
+            layout: layout.into(),
+            domain_id: id.into(),
+            domain_revision: revision,
+            geometry_revision: plan_revision,
+            borrow: None,
+            reference_released: false,
+        };
+        let resource = PlannedResource {
+            provider: descriptor::PROVIDER.into(),
+            resource_id: identity.clone(),
+            incarnation: None,
+            expected_revision: None,
+            execution_domain: self.request.consumer_requirements.execution_domain.clone(),
+            mutation_domains: vec![id.into()],
+            access: ResourceAccess::Exclusive,
+        };
+        let constraint = BindingConstraint {
+            capture_provider: CAPTURE.into(),
+            selector_schema: SELECTOR.into(),
+            resource_provider: descriptor::PROVIDER.into(),
+            resource_id: identity.clone(),
+            incarnation: None,
+            execution_domain: self.request.consumer_requirements.execution_domain.clone(),
+            mode: Some(mode.clone()),
+            plan_revision,
+        };
+        let cleanup = ResourceObligation {
+            obligation_id: format!("virtual-cleanup-{}", stable_hex("obligation", reference_id)),
+            provider: descriptor::PROVIDER.into(),
+            resource_id: identity.clone(),
+            mutation_domain: Some(id.into()),
+            depends_on: vec![],
+            cleanup_method: MethodRef {
+                service: descriptor::SERVICE.into(),
+                method: "lifecycle_callback".into(),
+                interface_major: 1,
+                interface_minor: 0,
+                schema_revision: 1,
+            },
+            payload: json!({"service":virtual_display::SERVICE,"identity":identity,"reference_id":reference_id}),
+        };
+        let plan = ResourcePlan {
+            plan_id: format!(
+                "display-plan-{}",
+                stable_hex("plan", &self.request.transition_id)
+            ),
+            revision: plan_revision,
+            resources: vec![resource],
+            mutation_domains: vec![MutationDomainPlan {
+                domain: id.into(),
+                expected_revision: revision,
+                borrowers: BTreeMap::new(),
+                access: ResourceAccess::Exclusive,
+            }],
+            required_capabilities: vec![],
+            constraints: json!({"virtual_display":selection}),
+            obligations: vec![cleanup],
+            affected_consumers: vec![],
+            consumer_change: ConsumerChange::ReconnectRequired,
+            candidate_constraint: Some(constraint),
+            allowed_degradation: vec![],
+        };
+        extension_api::validate_resource_plan(&plan).map_err(|_| "invalid_resource_plan")?;
+        Ok(plan)
+    }
+    fn finish(&mut self, result: PlanProgress) -> PlanProgress {
+        self.finished = Some(result.clone());
+        result
+    }
+}
+fn target_ids(target: &LifecycleTarget) -> Result<(&str, String), &'static str> {
+    match target {
+        LifecycleTarget::Session { session_id, .. } => Ok((
+            session_id,
+            serde_json::to_string(&("session", session_id)).map_err(|_| "invalid_target")?,
+        )),
+        LifecycleTarget::Stream {
+            session_id,
+            stream_id,
+            ..
+        } => Ok((
+            session_id,
+            serde_json::to_string(&("stream", session_id, stream_id))
+                .map_err(|_| "invalid_target")?,
+        )),
+        _ => Err("unsupported_target"),
+    }
+}
+fn stable_hex(namespace: &str, value: &str) -> String {
+    let input =
+        serde_json::to_vec(&(descriptor::PROVIDER, namespace, value)).expect("strings serialize");
+    format!("{:x}", Sha256::digest(input))[..32].into()
+}
+fn stable_uuid(namespace: &str, value: &str) -> String {
+    let mut bytes = Sha256::digest(
+        serde_json::to_vec(&(descriptor::PROVIDER, namespace, value)).expect("strings serialize"),
+    );
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
+}
+fn resolve_mode(
+    request: &ProviderRequest,
+    settings: &DisplaySettings,
+) -> Result<VideoMode, &'static str> {
+    let mut mode = request
+        .requested_video
+        .clone()
+        .ok_or("missing_requested_video")?;
+    if mode.hdr {
+        return Err("hdr_unsupported");
+    }
+    if settings.resolution == ResolutionSetting::Manual {
+        mode.width = settings.width;
+        mode.height = settings.height;
+    }
+    match settings.refresh {
+        RefreshSetting::Manual => {
+            let n = u64::from(settings.refresh_numerator) * 1000;
+            let d = u64::from(settings.refresh_denominator);
+            if d == 0 || n % d != 0 {
+                return Err("refresh_unrepresentable");
+            }
+            mode.refresh_millihz = u32::try_from(n / d).map_err(|_| "refresh_unrepresentable")?;
+        }
+        RefreshSetting::HighestAvailable => return Err("mode_enumeration_unavailable"),
+        _ => {}
+    }
+    if !(320..=7680).contains(&mode.width)
+        || !(200..=4320).contains(&mode.height)
+        || !(1000..=1_000_000).contains(&mode.refresh_millihz)
+    {
+        return Err("invalid_mode");
+    }
+    Ok(mode)
+}
+fn select_physical<'a>(
+    configuration: &'a physical_display::Configuration,
+    settings: &DisplaySettings,
+) -> Result<&'a physical_display::DisplaySetting, &'static str> {
+    let mut candidates =
+        configuration
+            .displays
+            .iter()
+            .filter(|display| match settings.physical_target {
+                PhysicalTargetSetting::Automatic => display.x == 0 && display.y == 0,
+                PhysicalTargetSetting::Identifier => display.id == settings.physical_display_id,
+            });
+    let selected = candidates.next().ok_or("physical_target_unavailable")?;
+    if candidates.next().is_some() {
+        return Err("physical_target_ambiguous");
+    }
+    Ok(selected)
+}
+fn make_exchange(
+    service: &str,
+    payload: Value,
+    request: &ProviderRequest,
+    label: &str,
+    parent: Option<u64>,
+    timeout_ms: u64,
+) -> Result<Exchange, &'static str> {
+    if timeout_ms == 0 {
+        return Err("deadline_expired");
+    }
+    let operation_id = format!(
+        "display-plan.{}.{}",
+        stable_hex("broker", &request.operation_id),
+        label
+    );
+    Ok(Exchange {
+        command: Command::Request {
+            service: service.into(),
+            payload,
+            timeout_ms,
+            operation_id,
+            parent,
+        },
+        id: None,
+        result: None,
+        uncertain: false,
+    })
+}
+fn rejected(reason: &str) -> PlanProgress {
+    PlanProgress::Complete(Box::new(ProviderResponse::Rejected {
+        reason: reason.into(),
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    fn request() -> ProviderRequest {
+        let mut settings =
+            amaterasu_configuration_schema::defaults(&crate::settings_schema::definitions())
+                .unwrap();
+        settings.insert("enabled".into(), json!(true));
+        serde_json::from_value(json!({"provider_sequence":3,"operation":"resource_plan","version":1,"transition_id":"transition-1","operation_id":"op-1","target":{"kind":"stream","host_epoch":"epoch-1","session_id":"session-1","stream_id":"stream-1","generation":1},"phase":"stream.prepare","settings_revision":"settings-1","settings":settings,"intent":"initial","reason":null,"requested_video":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false},"consumer_requirements":{"execution_domain":"desktop","capture_providers":[CAPTURE],"selector_schemas":[SELECTOR]},"remaining_ms":5000,"plan_revision":null,"admission_id":null,"approved_plan":null})).unwrap()
+    }
+    fn status() -> Value {
+        json!({"ok":true,"enabled":true,"native_supported":true,"driver":"libvirtualdisplay","ownership_authority":"unix_uid_broker","recovery_ready":true,"reference_owned":false,"monitors":[],"mutation_domain":{"id":"provider_session:abc","revision":7,"borrowers":0,"pending_mutations":0,"scope":"provider_session"},"settings":{"virtual_display_layout":"extended","dd_virtual_display_scale":0}})
+    }
+    fn run(status: Value) -> (PlanProgress, Vec<Command>) {
+        let mut planner = Planner::new(COORDINATOR, request(), Some(2), 0, |_| true).unwrap();
+        let mut responses = VecDeque::from([
+            Ok(Response::Accepted { id: 4 }),
+            Ok(Response::Result { payload: status }),
+            Ok(Response::Ok),
+        ]);
+        let mut commands = Vec::new();
+        let mut result = PlanProgress::Waiting;
+        for tick in 0..3 {
+            result = planner.poll(tick, &mut |cmd| {
+                commands.push(cmd);
+                responses.pop_front().unwrap()
+            });
+        }
+        (result, commands)
+    }
+    #[test]
+    fn available_provider_builds_bounded_plan_without_mutation() {
+        let (result, commands) = run(status());
+        let PlanProgress::Complete(response) = result else {
+            panic!("not planned: {result:?}")
+        };
+        let ProviderResponse::Planned { plan } = *response else {
+            panic!("unexpected response")
+        };
+        assert_eq!(plan.resources[0].provider, descriptor::PROVIDER);
+        assert_eq!(plan.mutation_domains[0].expected_revision, 7);
+        assert!(plan.mutation_domains[0].borrowers.is_empty());
+        assert_eq!(
+            plan.constraints["virtual_display"]["domain_id"],
+            "provider_session:abc"
+        );
+        assert_eq!(
+            plan.obligations[0].payload["service"],
+            virtual_display::SERVICE
+        );
+        assert_eq!(plan.candidate_constraint.as_ref().unwrap().plan_revision, 3);
+        assert_eq!(extension_api::validate_resource_plan(&plan), Ok(()));
+        assert_eq!(
+            extension_api::validate_provider_response(
+                &request(),
+                &ProviderResponse::Planned { plan: plan.clone() }
+            ),
+            Ok(())
+        );
+        assert!(
+            matches!(&commands[..],[Command::Request {service,payload,..},Command::TakeResult {..},Command::ReleaseResult {..}] if service==virtual_display::SERVICE && payload["action"]=="status")
+        );
+    }
+    #[test]
+    fn busy_or_incomplete_domain_never_produces_a_plan() {
+        let mut busy = status();
+        busy["mutation_domain"]["borrowers"] = json!(1);
+        assert!(
+            matches!(run(busy).0,PlanProgress::Complete(response) if matches!(&*response,ProviderResponse::Rejected { reason } if reason=="mutation_domain_busy"))
+        );
+        let mut missing = status();
+        missing.as_object_mut().unwrap().remove("mutation_domain");
+        assert!(
+            matches!(run(missing).0,PlanProgress::Complete(response) if matches!(&*response,ProviderResponse::Rejected { reason } if reason=="mutation_domain_unavailable"))
+        );
+    }
+    #[test]
+    fn authority_and_unsupported_requested_mode_fail_closed() {
+        assert!(Planner::new("other", request(), None, 0, |_| true).is_err());
+        assert!(Planner::new(COORDINATOR, request(), None, 0, |_| false).is_err());
+        let mut hdr = request();
+        hdr.requested_video.as_mut().unwrap().hdr = true;
+        assert!(Planner::new(COORDINATOR, hdr, None, 0, |_| true).is_err());
+        assert_ne!(
+            stable_hex(
+                "reference",
+                &serde_json::to_string(&("stream", "a:b", "c")).unwrap()
+            ),
+            stable_hex(
+                "reference",
+                &serde_json::to_string(&("stream", "a", "b:c")).unwrap()
+            )
+        );
+    }
+    #[test]
+    fn ambiguous_admission_or_provider_reply_never_produces_a_plan() {
+        let mut planner = Planner::new(COORDINATOR, request(), None, 0, |_| true).unwrap();
+        for tick in 0..3 {
+            assert_eq!(
+                planner.poll(tick, &mut |_| Err("lost".into())),
+                PlanProgress::Waiting
+            );
+        }
+        assert_eq!(
+            planner.poll(3, &mut |_| panic!("bounded")),
+            PlanProgress::Unknown
+        );
+        let mut invalid = status();
+        invalid["native_supported"] = json!(false);
+        assert!(matches!(
+            run(invalid).0,
+            PlanProgress::Complete(response) if matches!(*response, ProviderResponse::Rejected { .. })
+        ));
+    }
+    #[test]
+    fn physical_selection_never_falls_back_or_guesses_among_clones() {
+        let display = |id: &str, x| physical_display::DisplaySetting {
+            id: id.into(),
+            width: 1920,
+            height: 1080,
+            refresh: physical_display::Rational {
+                numerator: 60,
+                denominator: 1,
+            },
+            x,
+            y: 0,
+            rotation: physical_display::Rotation::Identity,
+            hdr_enabled: None,
+        };
+        let mut settings = DisplaySettings::default();
+        let mut configuration = physical_display::Configuration {
+            displays: vec![display("primary", 0), display("other", 1920)],
+        };
+        assert_eq!(
+            select_physical(&configuration, &settings).unwrap().id,
+            "primary"
+        );
+        settings.physical_target = PhysicalTargetSetting::Identifier;
+        settings.physical_display_id = "other".into();
+        assert_eq!(
+            select_physical(&configuration, &settings).unwrap().id,
+            "other"
+        );
+        settings.physical_display_id = "missing".into();
+        assert_eq!(
+            select_physical(&configuration, &settings),
+            Err("physical_target_unavailable")
+        );
+        settings.physical_target = PhysicalTargetSetting::Automatic;
+        configuration.displays[1].x = 0;
+        assert_eq!(
+            select_physical(&configuration, &settings),
+            Err("physical_target_ambiguous")
+        );
+    }
+}

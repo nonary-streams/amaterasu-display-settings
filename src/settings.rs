@@ -15,6 +15,9 @@ use crate::policy::{
 #[serde(default, deny_unknown_fields)]
 pub struct DisplaySettings {
     pub enabled: bool,
+    pub display_target: DisplayTargetSetting,
+    pub physical_target: PhysicalTargetSetting,
+    pub physical_display_id: String,
     pub resolution: ResolutionSetting,
     pub width: u32,
     pub height: u32,
@@ -30,6 +33,31 @@ pub struct DisplaySettings {
     pub retention_seconds: u32,
     pub keepalive_while_paused: bool,
     pub enforce_while_paused: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayTargetSetting {
+    #[default]
+    Virtual,
+    Physical,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PhysicalTargetSetting {
+    #[default]
+    Automatic,
+    Identifier,
+}
+
+/// An automatic selection is only intent; planning must resolve an exact
+/// physical output before coordinator admission, then fail closed on drift.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DisplaySelection {
+    Virtual,
+    PhysicalAutomatic,
+    PhysicalIdentifier(String),
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -102,6 +130,9 @@ impl Default for DisplaySettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            display_target: DisplayTargetSetting::Virtual,
+            physical_target: PhysicalTargetSetting::Automatic,
+            physical_display_id: String::new(),
             resolution: ResolutionSetting::Preserve,
             width: 1920,
             height: 1080,
@@ -130,6 +161,27 @@ pub struct LifecycleSettings {
 }
 
 impl DisplaySettings {
+    pub fn display_selection(&self) -> Result<DisplaySelection, &'static str> {
+        if self.physical_display_id.len() > 1024
+            || self.physical_display_id.chars().any(char::is_control)
+        {
+            return Err("invalid_physical_display_id");
+        }
+        match (self.display_target, self.physical_target) {
+            (DisplayTargetSetting::Virtual, _) => Ok(DisplaySelection::Virtual),
+            (DisplayTargetSetting::Physical, PhysicalTargetSetting::Automatic) => {
+                Ok(DisplaySelection::PhysicalAutomatic)
+            }
+            (DisplayTargetSetting::Physical, PhysicalTargetSetting::Identifier) => {
+                if self.physical_display_id.trim().is_empty() {
+                    return Err("missing_physical_display_id");
+                }
+                Ok(DisplaySelection::PhysicalIdentifier(
+                    self.physical_display_id.clone(),
+                ))
+            }
+        }
+    }
     pub fn lifecycle_settings(&self) -> LifecycleSettings {
         LifecycleSettings {
             enabled: self.enabled,
@@ -142,6 +194,7 @@ impl DisplaySettings {
     /// This projects display mode policy only; use `lifecycle_settings` for
     /// activation and paused-session behavior.
     pub fn to_policy(&self) -> Result<DisplayPolicy, &'static str> {
+        self.display_selection()?;
         let manual_resolution = Resolution {
             width: self.width,
             height: self.height,
@@ -279,6 +332,37 @@ mod tests {
         assert_eq!(
             policy.retention,
             RetentionPolicy::AfterDisconnect(Duration::from_secs(60))
+        );
+    }
+
+    #[test]
+    fn target_choice_keeps_automatic_separate_from_an_exact_identifier() {
+        let automatic: DisplaySettings = serde_json::from_value(json!({"display_target":"physical","physical_target":"automatic","physical_display_id":"old-id"})).unwrap();
+        assert_eq!(
+            automatic.display_selection(),
+            Ok(DisplaySelection::PhysicalAutomatic)
+        );
+        let explicit: DisplaySettings = serde_json::from_value(json!({"display_target":"physical","physical_target":"identifier","physical_display_id":"device-1"})).unwrap();
+        assert_eq!(
+            explicit.display_selection(),
+            Ok(DisplaySelection::PhysicalIdentifier("device-1".into()))
+        );
+        let missing: DisplaySettings = serde_json::from_value(
+            json!({"display_target":"physical","physical_target":"identifier"}),
+        )
+        .unwrap();
+        assert_eq!(
+            missing.display_selection(),
+            Err("missing_physical_display_id")
+        );
+        let invalid: DisplaySettings =
+            serde_json::from_value(json!({"physical_display_id":"bad\nname"})).unwrap();
+        assert_eq!(
+            invalid.display_selection(),
+            Err("invalid_physical_display_id")
+        );
+        assert!(
+            serde_json::from_value::<DisplaySettings>(json!({"display_target":"other"})).is_err()
         );
     }
 }

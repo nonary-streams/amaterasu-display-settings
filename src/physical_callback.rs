@@ -94,6 +94,8 @@ pub struct PhysicalCallback {
     result: Option<CallbackResult>,
     deadline_ms: u64,
     is_prepare: bool,
+    request: ProviderRequest,
+    callback_parent: Option<u64>,
 }
 
 impl PhysicalCallback {
@@ -106,6 +108,7 @@ impl PhysicalCallback {
         prior: Option<RecoveryObligation>,
         verify_admission: impl FnOnce(&ProviderRequest) -> bool,
         now_ms: u64,
+        callback_parent: Option<u64>,
     ) -> Result<Self, &'static str> {
         Self::build(
             caller,
@@ -114,6 +117,7 @@ impl PhysicalCallback {
             verify_admission,
             now_ms,
             cfg!(windows),
+            callback_parent,
         )
     }
 
@@ -124,6 +128,7 @@ impl PhysicalCallback {
         verify_admission: impl FnOnce(&ProviderRequest) -> bool,
         now_ms: u64,
         physical_supported: bool,
+        callback_parent: Option<u64>,
     ) -> Result<Self, &'static str> {
         if caller != COORDINATOR
             || extension_api::validate_provider_request(&request).is_err()
@@ -153,7 +158,7 @@ impl PhysicalCallback {
         // exclusive resources in the coordinator's execution domain.
         if physical.configuration.displays.len() != plan.resources.len()
             || plan.resources.iter().any(|resource| {
-                resource.provider != physical_display::SERVICE
+                resource.provider != crate::descriptor::PROVIDER
                     || resource.access != ResourceAccess::Exclusive
                     || resource.execution_domain != request.consumer_requirements.execution_domain
                     || !physical
@@ -169,6 +174,9 @@ impl PhysicalCallback {
             request.phase,
             LifecyclePhase::SessionPrepare | LifecyclePhase::StreamPrepare
         );
+        if is_prepare && callback_parent.is_none() {
+            return Err("missing_callback_parent");
+        }
         let obligation = if is_prepare {
             if prior.is_some() {
                 return Err("unexpected_prior_obligation");
@@ -198,16 +206,12 @@ impl PhysicalCallback {
         let call = physical_display::PendingCall::new(
             action,
             format!("physical.{}", request.operation_id),
-            None,
+            if is_prepare { callback_parent } else { None },
             timeout,
             now_ms,
         )?;
-        let mut request_value = serde_json::to_value(&request).map_err(|_| "invalid_request")?;
-        // Remaining time changes between retries and is not operation identity.
-        request_value
-            .as_object_mut()
-            .ok_or("invalid_request")?
-            .remove("remaining_ms");
+        // The coordinator persists the entire frozen request, including remaining_ms.
+        let request_value = serde_json::to_value(&request).map_err(|_| "invalid_request")?;
         if serde_json::to_vec(&request_value)
             .map_err(|_| "invalid_request")?
             .len()
@@ -217,7 +221,7 @@ impl PhysicalCallback {
         }
         Ok(Self {
             sequence: request.provider_sequence,
-            operation_id: request.operation_id,
+            operation_id: request.operation_id.clone(),
             request_value,
             saved: obligation.clone(),
             obligation,
@@ -226,6 +230,8 @@ impl PhysicalCallback {
             result: None,
             deadline_ms: now_ms.saturating_add(timeout),
             is_prepare,
+            request,
+            callback_parent,
         })
     }
 
@@ -237,6 +243,7 @@ impl PhysicalCallback {
         now_ms: u64,
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
         store: &mut impl DurableStore,
+        guard: &mut impl crate::virtual_callback::EffectGuard,
     ) -> CallbackProgress {
         if self.phase != Phase::Done && now_ms >= self.deadline_ms {
             self.result = None;
@@ -306,6 +313,29 @@ impl PhysicalCallback {
                 }
             }
             Phase::Physical => {
+                if self.is_prepare && self.call.request_id().is_none() {
+                    let Some(parent) = self.callback_parent else {
+                        self.phase = Phase::Done;
+                        return CallbackProgress::RecoveryRequired;
+                    };
+                    match guard.poll(
+                        &self.request,
+                        crate::virtual_callback::EffectKind::PhysicalApply,
+                        parent,
+                        now_ms,
+                        send,
+                    ) {
+                        crate::virtual_callback::GuardProgress::Waiting => {
+                            return CallbackProgress::Waiting;
+                        }
+                        crate::virtual_callback::GuardProgress::Authorized => {}
+                        crate::virtual_callback::GuardProgress::Rejected
+                        | crate::virtual_callback::GuardProgress::Unknown => {
+                            self.phase = Phase::Done;
+                            return CallbackProgress::RecoveryRequired;
+                        }
+                    }
+                }
                 let saved = &self.saved;
                 let mut changed = None;
                 let progress = self.call.poll(now_ms, send, &mut |next| {
@@ -386,9 +416,35 @@ mod tests {
             "phase":"stream.prepare","settings_revision":"settings-1","settings":{},"intent":"initial","reason":null,"requested_video":null,
             "consumer_requirements":{"execution_domain":"desktop","capture_providers":["capture"],"selector_schemas":["selector"]},
             "remaining_ms":5000,"plan_revision":1,"admission_id":"admission-1",
-            "approved_plan":{"plan_id":"plan-1","revision":1,"resources":[{"provider":"amaterasu.display/1","resource_id":"display-1","incarnation":null,"expected_revision":null,"execution_domain":"desktop","mutation_domains":[],"access":"exclusive"}],
+            "approved_plan":{"plan_id":"plan-1","revision":1,"resources":[{"provider":"nonary.display-settings","resource_id":"display-1","incarnation":null,"expected_revision":null,"execution_domain":"desktop","mutation_domains":[],"access":"exclusive"}],
             "mutation_domains":[],"required_capabilities":[],"constraints":{"physical":{"provider":"amaterasu.display/1","configuration":{"displays":[{"id":"display-1","width":1920,"height":1080,"refresh":{"numerator":60,"denominator":1},"x":0,"y":0}]},"expected_topology_revision":"0123456789abcdef0123456789abcdef"}},"obligations":[],"affected_consumers":[],"consumer_change":"reconnect_required","candidate_constraint":null,"allowed_degradation":[]}
         })).unwrap()
+    }
+    struct AllowGuard;
+    impl crate::virtual_callback::EffectGuard for AllowGuard {
+        fn poll(
+            &mut self,
+            _: &ProviderRequest,
+            _: crate::virtual_callback::EffectKind,
+            _: u64,
+            _: u64,
+            _: &mut impl FnMut(Command) -> ModuleResult<Response>,
+        ) -> crate::virtual_callback::GuardProgress {
+            crate::virtual_callback::GuardProgress::Authorized
+        }
+    }
+    struct DenyGuard;
+    impl crate::virtual_callback::EffectGuard for DenyGuard {
+        fn poll(
+            &mut self,
+            _: &ProviderRequest,
+            _: crate::virtual_callback::EffectKind,
+            _: u64,
+            _: u64,
+            _: &mut impl FnMut(Command) -> ModuleResult<Response>,
+        ) -> crate::virtual_callback::GuardProgress {
+            crate::virtual_callback::GuardProgress::Rejected
+        }
     }
     struct FakeStore {
         replies: VecDeque<StoreProgress>,
@@ -403,7 +459,8 @@ mod tests {
     #[test]
     fn apply_waits_for_each_durable_ack_before_dispatch_and_completion() {
         let mut callback =
-            PhysicalCallback::build(COORDINATOR, request(), None, |_| true, 0, true).unwrap();
+            PhysicalCallback::build(COORDINATOR, request(), None, |_| true, 0, true, Some(99))
+                .unwrap();
         let mut store = FakeStore {
             replies: VecDeque::from([
                 StoreProgress::Reserved,
@@ -422,40 +479,41 @@ mod tests {
             Ok(Response::Ok),
         ]);
         let mut commands = Vec::new();
+        let mut guard = AllowGuard;
         let mut send = |command: Command| {
             commands.push(command);
             responses.pop_front().unwrap()
         };
         assert_eq!(
-            callback.poll(1, &mut send, &mut store),
+            callback.poll(1, &mut send, &mut store, &mut guard),
             CallbackProgress::Waiting
         );
         assert_eq!(
-            callback.poll(2, &mut send, &mut store),
+            callback.poll(2, &mut send, &mut store, &mut guard),
             CallbackProgress::Waiting
         );
         assert_eq!(
-            callback.poll(3, &mut send, &mut store),
+            callback.poll(3, &mut send, &mut store, &mut guard),
             CallbackProgress::Waiting
         );
         assert_eq!(
-            callback.poll(4, &mut send, &mut store),
+            callback.poll(4, &mut send, &mut store, &mut guard),
             CallbackProgress::Waiting
         );
         assert_eq!(
-            callback.poll(5, &mut send, &mut store),
+            callback.poll(5, &mut send, &mut store, &mut guard),
             CallbackProgress::Waiting
         );
         assert_eq!(
-            callback.poll(6, &mut send, &mut store),
+            callback.poll(6, &mut send, &mut store, &mut guard),
             CallbackProgress::Waiting
         );
         assert_eq!(
-            callback.poll(7, &mut send, &mut store),
+            callback.poll(7, &mut send, &mut store, &mut guard),
             CallbackProgress::Waiting
         );
         assert_eq!(
-            callback.poll(8, &mut send, &mut store),
+            callback.poll(8, &mut send, &mut store, &mut guard),
             CallbackProgress::Complete(CallbackResult::Applied {
                 lease: "lease-1".into()
             })
@@ -477,24 +535,61 @@ mod tests {
     }
     #[test]
     fn rejected_admission_and_platform_never_dispatch() {
-        assert!(PhysicalCallback::build("other", request(), None, |_| true, 0, true).is_err());
-        assert!(PhysicalCallback::build(COORDINATOR, request(), None, |_| false, 0, true).is_err());
-        assert!(PhysicalCallback::build(COORDINATOR, request(), None, |_| true, 0, false).is_err());
+        assert!(
+            PhysicalCallback::build("other", request(), None, |_| true, 0, true, Some(99)).is_err()
+        );
+        assert!(
+            PhysicalCallback::build(COORDINATOR, request(), None, |_| false, 0, true, Some(99))
+                .is_err()
+        );
+        assert!(
+            PhysicalCallback::build(COORDINATOR, request(), None, |_| true, 0, false, Some(99))
+                .is_err()
+        );
         let mut altered = request();
         altered.approved_plan.as_mut().unwrap().resources[0].resource_id = "other".into();
-        assert!(PhysicalCallback::build(COORDINATOR, altered, None, |_| true, 0, true).is_err());
+        assert!(
+            PhysicalCallback::build(COORDINATOR, altered, None, |_| true, 0, true, Some(99))
+                .is_err()
+        );
     }
     #[test]
     fn pending_receipt_is_never_replayed() {
         let mut callback =
-            PhysicalCallback::build(COORDINATOR, request(), None, |_| true, 0, true).unwrap();
+            PhysicalCallback::build(COORDINATOR, request(), None, |_| true, 0, true, Some(99))
+                .unwrap();
         let mut store = FakeStore {
             replies: VecDeque::from([StoreProgress::ExistingPending]),
             commands: vec![],
         };
+        let mut guard = AllowGuard;
         let mut send = |_: Command| panic!("must not send physical operation");
         assert_eq!(
-            callback.poll(1, &mut send, &mut store),
+            callback.poll(1, &mut send, &mut store, &mut guard),
+            CallbackProgress::RecoveryRequired
+        );
+    }
+    #[test]
+    fn expired_prepare_cannot_apply_after_async_persistence() {
+        let mut callback =
+            PhysicalCallback::build(COORDINATOR, request(), None, |_| true, 0, true, Some(99))
+                .unwrap();
+        let mut store = FakeStore {
+            replies: VecDeque::from([StoreProgress::Reserved, StoreProgress::Saved]),
+            commands: vec![],
+        };
+        let mut guard = DenyGuard;
+        let mut send = |_: Command| panic!("stale physical apply must not dispatch");
+        assert_eq!(
+            callback.poll(1, &mut send, &mut store, &mut guard),
+            CallbackProgress::Waiting
+        );
+        assert_eq!(
+            callback.poll(2, &mut send, &mut store, &mut guard),
+            CallbackProgress::Waiting
+        );
+        assert_eq!(
+            callback.poll(3, &mut send, &mut store, &mut guard),
             CallbackProgress::RecoveryRequired
         );
     }
@@ -502,7 +597,8 @@ mod tests {
     #[test]
     fn failed_lease_persistence_never_releases_result_or_reports_success() {
         let mut callback =
-            PhysicalCallback::build(COORDINATOR, request(), None, |_| true, 0, true).unwrap();
+            PhysicalCallback::build(COORDINATOR, request(), None, |_| true, 0, true, Some(99))
+                .unwrap();
         let mut store = FakeStore {
             replies: VecDeque::from([
                 StoreProgress::Reserved,
@@ -518,22 +614,23 @@ mod tests {
             }),
         ]);
         let mut commands = Vec::new();
+        let mut guard = AllowGuard;
         let mut send = |command: Command| {
             commands.push(command);
             responses.pop_front().unwrap()
         };
         for tick in 1..=4 {
             assert_eq!(
-                callback.poll(tick, &mut send, &mut store),
+                callback.poll(tick, &mut send, &mut store, &mut guard),
                 CallbackProgress::Waiting
             );
         }
         assert_eq!(
-            callback.poll(5, &mut send, &mut store),
+            callback.poll(5, &mut send, &mut store, &mut guard),
             CallbackProgress::RecoveryRequired
         );
         assert_eq!(
-            callback.poll(6, &mut send, &mut store),
+            callback.poll(6, &mut send, &mut store, &mut guard),
             CallbackProgress::RecoveryRequired
         );
         assert_eq!(commands.len(), 2);
@@ -562,19 +659,21 @@ mod tests {
             |_| true,
             0,
             true,
+            None,
         )
         .unwrap();
         let mut store = FakeStore {
             replies: VecDeque::from([StoreProgress::Reserved, StoreProgress::Unknown]),
             commands: vec![],
         };
+        let mut guard = AllowGuard;
         let mut send = |_: Command| panic!("unverified lease must not be used");
         assert_eq!(
-            callback.poll(1, &mut send, &mut store),
+            callback.poll(1, &mut send, &mut store, &mut guard),
             CallbackProgress::Waiting
         );
         assert_eq!(
-            callback.poll(2, &mut send, &mut store),
+            callback.poll(2, &mut send, &mut store, &mut guard),
             CallbackProgress::RecoveryRequired
         );
         assert!(

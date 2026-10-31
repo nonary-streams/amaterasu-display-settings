@@ -4,6 +4,7 @@
 //! Each call to [`PendingCall::poll`] performs at most one broker command.
 
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const SERVICE: &str = "amaterasu.virtual-display/1";
@@ -83,15 +84,34 @@ impl CreateDisplay {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DisplayRequest {
     Create(CreateDisplay),
+    CreatePlanned {
+        create: CreateDisplay,
+        layout: String,
+        domain_id: String,
+        revision: u64,
+    },
     Status(DisplayReference),
     Remove(DisplayReference),
+    Borrow(DisplayReference),
+    ValidateBorrow {
+        reference: DisplayReference,
+        borrow_id: String,
+    },
+    ReleaseBorrow {
+        reference: DisplayReference,
+        borrow_id: String,
+    },
 }
 
 impl DisplayRequest {
     fn reference(&self) -> &DisplayReference {
         match self {
-            Self::Create(create) => &create.reference,
-            Self::Status(reference) | Self::Remove(reference) => reference,
+            Self::Create(create) | Self::CreatePlanned { create, .. } => &create.reference,
+            Self::Status(reference)
+            | Self::Remove(reference)
+            | Self::Borrow(reference)
+            | Self::ValidateBorrow { reference, .. }
+            | Self::ReleaseBorrow { reference, .. } => reference,
         }
     }
 
@@ -99,7 +119,7 @@ impl DisplayRequest {
         self.reference().validate()?;
         let reference = self.reference();
         Ok(match self {
-            Self::Create(create) => {
+            Self::Create(create) | Self::CreatePlanned { create, .. } => {
                 create.validate()?;
                 let mut value = json!({"action":"create", "identity":reference.identity,
                     "reference_id":reference.reference_id, "width":create.width,
@@ -107,6 +127,22 @@ impl DisplayRequest {
                     "name":create.name, "hdr_enabled":create.hdr_enabled});
                 if let Some(scale) = create.scale {
                     value["dd_virtual_display_scale"] = json!(scale);
+                }
+                if let Self::CreatePlanned {
+                    layout,
+                    domain_id,
+                    revision,
+                    ..
+                } = self
+                {
+                    if !matches!(layout.as_str(), "exclusive" | "extended")
+                        || !valid_domain_id(domain_id)
+                    {
+                        return Err("invalid topology plan");
+                    }
+                    value["virtual_display_layout"] = json!(layout);
+                    value["expected_topology_domain_id"] = json!(domain_id);
+                    value["expected_topology_revision"] = json!(revision);
                 }
                 value
             }
@@ -116,8 +152,59 @@ impl DisplayRequest {
             Self::Remove(_) => {
                 json!({"action":"remove", "identity":reference.identity, "reference_id":reference.reference_id})
             }
+            Self::Borrow(_) => {
+                json!({"action":"borrow","identity":reference.identity,"reference_id":reference.reference_id})
+            }
+            Self::ValidateBorrow { borrow_id, .. } | Self::ReleaseBorrow { borrow_id, .. } => {
+                if !valid_borrow_id(borrow_id) {
+                    return Err("invalid borrow id");
+                }
+                json!({"action": if matches!(self, Self::ValidateBorrow { .. }) { "validate_borrow" } else { "release_borrow" }, "identity":reference.identity, "reference_id":reference.reference_id, "borrow_id":borrow_id})
+            }
         })
     }
+}
+
+fn valid_borrow_id(id: &str) -> bool {
+    id.len() == 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+fn valid_domain_id(id: &str) -> bool {
+    id.starts_with("provider_session:")
+        && id.len() > 17
+        && id.len() <= 256
+        && !id.chars().any(char::is_control)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedOutput {
+    pub version: u32,
+    pub protocol: String,
+    pub compositor_id: String,
+    pub registry_global: u32,
+    pub output_name: String,
+    pub width: u32,
+    pub height: u32,
+    pub refresh_millihz: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MutationDomain {
+    pub id: String,
+    pub revision: u64,
+    pub borrowers: u64,
+    pub pending_mutations: u64,
+    pub scope: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DisplayBorrow {
+    pub borrow_id: String,
+    pub observed_output: ObservedOutput,
+    pub mutation_domain: MutationDomain,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -135,7 +222,9 @@ pub enum DisplayOutcome {
     /// Provider reports monitor identity published; capture is not established.
     Ready(ReadyDisplay),
     /// The queried caller reference is absent; other references may remain.
-    ReferenceAbsent { monitor_present: bool },
+    ReferenceAbsent {
+        monitor_present: bool,
+    },
     /// Reference was released but native cleanup is not yet confirmed.
     CleanupPending,
     /// Provider confirms this caller's reference is gone and another remains.
@@ -144,6 +233,8 @@ pub enum DisplayOutcome {
     Removed,
     /// The provider did not establish successful completion.
     ProviderError(String),
+    Borrowed(DisplayBorrow),
+    BorrowReleased(MutationDomain),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -213,6 +304,12 @@ impl PendingCall {
     /// broker reconciliation if polling ends in an unknown state.
     pub fn request_id(&self) -> Option<u64> {
         self.request_id
+    }
+
+    /// Parsed result before broker release. Persist newly acquired borrow IDs
+    /// before polling again; only `Complete` confirms result release.
+    pub fn tentative(&self) -> Option<&DisplayOutcome> {
+        self.result.as_ref()
     }
 
     /// The supplied clock must be monotonic and use the same units as `new`.
@@ -293,11 +390,26 @@ fn parse_response(request: &DisplayRequest, payload: &Value) -> Option<DisplayOu
     }
     let identity = &request.reference().identity;
     match request {
-        DisplayRequest::Create(create) => {
+        DisplayRequest::Create(create) | DisplayRequest::CreatePlanned { create, .. } => {
             if !payload.get("reference_owned")?.as_bool()? {
                 return None;
             }
             let monitor = payload.get("monitor")?;
+            if let DisplayRequest::CreatePlanned { layout, .. } = request
+                && monitor.get("virtual_display_layout")?.as_str()? != layout
+            {
+                return None;
+            }
+            if let DisplayRequest::CreatePlanned { .. } = request
+                && create.scale.is_some_and(|scale| {
+                    monitor
+                        .get("dd_virtual_display_scale")
+                        .and_then(Value::as_i64)
+                        != Some(i64::from(scale))
+                })
+            {
+                return None;
+            }
             if !monitor_matches(monitor, identity) {
                 return None;
             }
@@ -375,7 +487,63 @@ fn parse_response(request: &DisplayRequest, payload: &Value) -> Option<DisplayOu
                 _ => None,
             }
         }
+        DisplayRequest::Borrow(_) | DisplayRequest::ValidateBorrow { .. } => {
+            let borrow_id = payload.get("borrow_id")?.as_str()?.to_owned();
+            if !valid_borrow_id(&borrow_id) {
+                return None;
+            }
+            if let DisplayRequest::ValidateBorrow {
+                borrow_id: expected,
+                ..
+            } = request
+                && &borrow_id != expected
+            {
+                return None;
+            }
+            let observed_output: ObservedOutput =
+                serde_json::from_value(payload.get("observed_output")?.clone()).ok()?;
+            let mutation_domain = parse_domain(payload)?;
+            if observed_output.version != 1
+                || observed_output.protocol != "wayland-wl-output"
+                || !valid_borrow_id(&observed_output.compositor_id)
+                || observed_output.registry_global == 0
+                || observed_output.width == 0
+                || observed_output.height == 0
+                || observed_output.refresh_millihz == 0
+                || !valid_output_name(&observed_output.output_name)
+            {
+                return None;
+            }
+            Some(DisplayOutcome::Borrowed(DisplayBorrow {
+                borrow_id,
+                observed_output,
+                mutation_domain,
+            }))
+        }
+        DisplayRequest::ReleaseBorrow { .. } => {
+            if payload.get("released")?.as_bool()? {
+                Some(DisplayOutcome::BorrowReleased(parse_domain(payload)?))
+            } else {
+                None
+            }
+        }
     }
+}
+
+fn parse_domain(payload: &Value) -> Option<MutationDomain> {
+    let domain: MutationDomain =
+        serde_json::from_value(payload.get("mutation_domain")?.clone()).ok()?;
+    if domain.scope != "provider_session" || !valid_domain_id(&domain.id) {
+        return None;
+    }
+    Some(domain)
+}
+fn valid_output_name(name: &str) -> bool {
+    name.strip_prefix("Virtual-").is_some_and(|value| {
+        !value.starts_with('0')
+            && value.bytes().all(|b| b.is_ascii_digit())
+            && value.parse::<i32>().is_ok_and(|n| n > 0)
+    })
 }
 
 fn monitor_matches(monitor: &Value, identity: &str) -> bool {

@@ -1,74 +1,196 @@
-//! Native module entry point for validated extension settings.
+//! Native extension API entry point. Lifecycle effects stay closed until the
+//! coordinator can prove the complete admitted request and retirement fence.
+use crate::coordinator::{PendingVerification, Verification};
 use amaterasu_module_sdk::{
-    ApiFieldKind, ApiMethod, ApiPrivilege, ApiSchema, Command, ManagedModule, ModuleResult,
+    ApiFieldKind as Kind, ApiMethod, ApiPrivilege, ApiSchema, Command, ManagedModule, ModuleResult,
     Response, RuntimeClient,
+    extension_api::{
+        self, LifecyclePhase, LifecycleTarget, ProviderOperation, ProviderRequest,
+        ProviderStatusRequest,
+    },
 };
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use sha2::{Digest, Sha256};
+use std::{collections::BTreeMap, time::Instant};
 
 const SERVICE: &str = "nonary.display-settings/1";
 const REGISTRY_CALLER: &str = "amaterasu.extension-registry";
+const LIFECYCLE_CALLER: &str = "amaterasu.session-lifecycle";
+const MAX_PENDING: usize = 32;
 
-/// Only the settings validation endpoint is registered until lifecycle effect
-/// admission and receipt retirement are implemented.
 pub struct DisplaySettingsModule {
     runtime: RuntimeClient,
+    clock: Instant,
+    pending: Vec<PendingRequest>,
 }
-
-fn registration() -> Command {
-    let schema = |required: &[(&str, ApiFieldKind)], optional: &[(&str, ApiFieldKind)]| ApiSchema {
+struct PendingRequest {
+    request_id: u64,
+    phase: PendingPhase,
+}
+enum PendingPhase {
+    Plan {
+        planner: Box<crate::resource_plan::Planner>,
+    },
+    StatusLookup {
+        status: Box<ProviderStatusRequest>,
+        lookup: Box<crate::durable_store::PriorReceiptLookup>,
+    },
+    StatusVerify {
+        request: Box<ProviderRequest>,
+        receipt: Box<crate::receipt_store::Receipt>,
+        verification: Box<PendingVerification>,
+    },
+    Verify {
+        request: Box<ProviderRequest>,
+        verification: Box<PendingVerification>,
+    },
+    PhysicalLoad {
+        request: Box<ProviderRequest>,
+        store: Box<crate::durable_store::StateDurableStore>,
+    },
+    VirtualLoad {
+        request: Box<ProviderRequest>,
+        store: Box<crate::durable_store::VirtualDurableStateStore>,
+    },
+    Physical {
+        machine: Box<crate::physical_callback::PhysicalCallback>,
+        store: Box<crate::durable_store::StateDurableStore>,
+        obligations: Vec<extension_api::ResourceObligation>,
+        guard: Box<LiveEffectGuard>,
+    },
+    BindingLoad {
+        request: Box<crate::virtual_callback::BindingValidationRequest>,
+        store: Box<crate::durable_store::VirtualDurableStateStore>,
+        timeout_ms: u64,
+    },
+    Binding {
+        validator: Box<crate::virtual_callback::BindingValidator>,
+        store: Box<crate::durable_store::VirtualDurableStateStore>,
+    },
+    Virtual {
+        machine: Box<crate::virtual_callback::VirtualCallback>,
+        store: Box<crate::durable_store::VirtualDurableStateStore>,
+        obligations: Vec<extension_api::ResourceObligation>,
+        guard: Box<LiveEffectGuard>,
+    },
+}
+fn schema(required: &[(&str, Kind)], optional: &[(&str, Kind)]) -> ApiSchema {
+    ApiSchema {
         required: required
             .iter()
             .cloned()
-            .map(|(key, value)| (key.to_owned(), value))
+            .map(|(k, v)| (k.into(), v))
             .collect(),
         optional: optional
             .iter()
             .cloned()
-            .map(|(key, value)| (key.to_owned(), value))
+            .map(|(k, v)| (k.into(), v))
             .collect::<BTreeMap<_, _>>(),
         allow_extra: false,
+    }
+}
+fn registration(method: &str) -> Command {
+    let provider_fields = [
+        ("provider_sequence", Kind::Integer),
+        ("operation", Kind::String),
+        ("version", Kind::Integer),
+        ("transition_id", Kind::String),
+        ("operation_id", Kind::String),
+        ("target", Kind::Object),
+        ("phase", Kind::String),
+        ("settings_revision", Kind::String),
+        ("settings", Kind::Object),
+        ("intent", Kind::Any),
+        ("reason", Kind::Any),
+        ("requested_video", Kind::Any),
+        ("consumer_requirements", Kind::Object),
+        ("remaining_ms", Kind::Integer),
+        ("plan_revision", Kind::Any),
+        ("admission_id", Kind::Any),
+        ("approved_plan", Kind::Any),
+    ];
+    let request = match method {
+        "settings_validate" => schema(&[("values", Kind::Object)], &[]),
+        "resource_plan" | "lifecycle_callback" => schema(&provider_fields, &[]),
+        "lifecycle_status" => schema(
+            &[
+                ("provider_sequence", Kind::Integer),
+                ("operation_id", Kind::String),
+                ("transition_id", Kind::String),
+                ("receipt_id", Kind::String),
+            ],
+            &[],
+        ),
+        "binding_validate" => schema(
+            &[
+                ("operation_id", Kind::String),
+                ("transition_id", Kind::String),
+                ("target", Kind::Object),
+                ("plan_revision", Kind::Integer),
+                ("borrow_id", Kind::String),
+                ("binding", Kind::Object),
+                ("observation", Kind::Object),
+            ],
+            &[],
+        ),
+        _ => unreachable!("known registered method"),
+    };
+    let response = if method == "settings_validate" {
+        schema(
+            &[("ok", Kind::Boolean), ("valid", Kind::Boolean)],
+            &[("message", Kind::String)],
+        )
+    } else {
+        schema(
+            &[("status", Kind::String)],
+            &[
+                ("reason", Kind::String),
+                ("receipt_id", Kind::String),
+                ("plan", Kind::Object),
+                ("candidate", Kind::Any),
+                ("obligations", Kind::Array),
+                ("outcomes", Kind::Array),
+                ("operation_id", Kind::String),
+                ("target", Kind::Object),
+                ("plan_revision", Kind::Integer),
+                ("binding", Kind::Object),
+                ("observation", Kind::Object),
+            ],
+        )
     };
     Command::RegisterApi {
         method: ApiMethod {
             service: SERVICE.into(),
-            method: "settings_validate".into(),
+            method: method.into(),
             interface_major: 1,
             interface_minor: 0,
-            request: schema(&[("values", ApiFieldKind::Object)], &[]),
-            response: schema(
-                &[
-                    ("ok", ApiFieldKind::Boolean),
-                    ("valid", ApiFieldKind::Boolean),
-                ],
-                &[("message", ApiFieldKind::String)],
-            ),
+            request,
+            response,
             privilege: ApiPrivilege::User,
         },
     }
 }
-
+fn arguments(payload: &Value) -> Option<(&str, &Value)> {
+    let object = payload.as_object()?;
+    if object.len() != 4
+        || object.get("interface_major")?.as_u64()? != 1
+        || object.get("interface_minor")?.as_u64()? != 0
+    {
+        return None;
+    }
+    Some((object.get("method")?.as_str()?, object.get("arguments")?))
+}
 fn validate_request(caller: &str, payload: Value) -> Value {
     if caller != REGISTRY_CALLER {
         return json!({"ok":true,"valid":false,"message":"unauthorized caller"});
     }
-    let Some(object) = payload.as_object() else {
+    let Some(("settings_validate", arguments)) = arguments(&payload) else {
         return json!({"ok":true,"valid":false,"message":"invalid request"});
     };
-    if object.len() != 4
-        || object.get("method").and_then(Value::as_str) != Some("settings_validate")
-        || object.get("interface_major").and_then(Value::as_u64) != Some(1)
-        || object.get("interface_minor").and_then(Value::as_u64) != Some(0)
-    {
-        return json!({"ok":true,"valid":false,"message":"invalid request"});
-    }
-    let Some(arguments) = object.get("arguments").and_then(Value::as_object) else {
+    let Some(object) = arguments.as_object().filter(|value| value.len() == 1) else {
         return json!({"ok":true,"valid":false,"message":"invalid request"});
     };
-    if arguments.len() != 1 {
-        return json!({"ok":true,"valid":false,"message":"invalid request"});
-    }
-    let values = arguments
+    let values = object
         .get("values")
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok());
@@ -80,14 +202,586 @@ fn validate_request(caller: &str, payload: Value) -> Value {
         None => json!({"ok":true,"valid":false,"message":"invalid settings"}),
     }
 }
-
+fn rejected(reason: &str) -> Value {
+    json!({"status":"rejected","reason":reason})
+}
+fn recovery(reason: &str) -> Value {
+    json!({"status":"recovery_required","reason":reason})
+}
+enum Dispatch {
+    Immediate(Value),
+    Verify(Box<ProviderRequest>, Box<PendingVerification>),
+    Binding(Box<crate::virtual_callback::BindingValidationRequest>),
+    Plan(Box<ProviderRequest>),
+    Status(Box<ProviderStatusRequest>),
+}
+fn dispatch(caller: &str, payload: &Value, now_ms: u64, remaining_ms: u64) -> Dispatch {
+    let Some((method, args)) = arguments(payload) else {
+        return Dispatch::Immediate(rejected("invalid_request"));
+    };
+    if caller != LIFECYCLE_CALLER {
+        return Dispatch::Immediate(rejected("unauthorized_caller"));
+    }
+    match method {
+        "resource_plan" | "lifecycle_callback" => {
+            let Ok(request) = serde_json::from_value::<ProviderRequest>(args.clone()) else {
+                return Dispatch::Immediate(rejected("invalid_request"));
+            };
+            let expected = if method == "resource_plan" {
+                ProviderOperation::ResourcePlan
+            } else {
+                ProviderOperation::LifecycleCallback
+            };
+            if request.operation != expected
+                || extension_api::validate_provider_request(&request).is_err()
+            {
+                return Dispatch::Immediate(rejected("invalid_request"));
+            }
+            if remaining_ms == 0 {
+                return Dispatch::Immediate(rejected("request_ended"));
+            }
+            if request.operation == ProviderOperation::ResourcePlan {
+                return Dispatch::Plan(Box::new(request));
+            }
+            match PendingVerification::from_request(caller, &request, now_ms) {
+                Ok(verification) => Dispatch::Verify(Box::new(request), Box::new(verification)),
+                Err(_) => Dispatch::Immediate(rejected("invalid_coordinator_admission")),
+            }
+        }
+        "lifecycle_status" => match serde_json::from_value::<ProviderStatusRequest>(args.clone()) {
+            Ok(status) if status.receipt_id == status.operation_id && remaining_ms > 0 => {
+                Dispatch::Status(Box::new(status))
+            }
+            _ => Dispatch::Immediate(rejected("invalid_request")),
+        },
+        "binding_validate" => {
+            match serde_json::from_value::<crate::virtual_callback::BindingValidationRequest>(
+                args.clone(),
+            ) {
+                Ok(request) if remaining_ms > 0 => Dispatch::Binding(Box::new(request)),
+                _ => Dispatch::Immediate(rejected("invalid_request")),
+            }
+        }
+        _ => Dispatch::Immediate(rejected("unknown_method")),
+    }
+}
+// Effect dispatch remains disabled until the full runtime path is reviewed and
+// production coordinator admission and status recovery are available.
+fn effect_recovery_available() -> bool {
+    false
+}
+fn target_store_key(target: &LifecycleTarget) -> Result<String, &'static str> {
+    let encoded = serde_json::to_vec(target).map_err(|_| "invalid_target")?;
+    Ok(format!("target-{:x}", Sha256::digest(encoded)))
+}
+fn target_epoch(target: &LifecycleTarget) -> &str {
+    match target {
+        LifecycleTarget::Session { host_epoch, .. }
+        | LifecycleTarget::Stream { host_epoch, .. }
+        | LifecycleTarget::Validation { host_epoch, .. } => host_epoch,
+    }
+}
+fn cleanup(obligations: &[extension_api::ResourceObligation]) -> Value {
+    let outcomes: Vec<_> = obligations.iter().map(|obligation| json!({"obligation_id":obligation.obligation_id,"state":"released","reason":null})).collect();
+    json!({"status":"cleanup","outcomes":outcomes})
+}
+fn admitted_obligations(
+    request: &ProviderRequest,
+) -> Result<Vec<extension_api::ResourceObligation>, &'static str> {
+    let plan = request.approved_plan.as_ref().ok_or("missing_plan")?;
+    if plan.obligations.is_empty() {
+        return Err("missing_cleanup_obligation");
+    }
+    let virtual_constraint = plan.constraints.get("virtual_display");
+    let physical_constraint = plan.constraints.get("physical");
+    let valid = plan.obligations.iter().all(|obligation| {
+        if obligation.provider != crate::descriptor::PROVIDER
+            || obligation.cleanup_method.service != SERVICE
+            || obligation.cleanup_method.method != "lifecycle_callback"
+            || obligation.cleanup_method.interface_major != 1
+            || obligation.cleanup_method.interface_minor != 0
+        {
+            return false;
+        }
+        if let Some(constraint) = virtual_constraint {
+            return constraint.get("identity").and_then(Value::as_str)
+                == Some(obligation.resource_id.as_str())
+                && constraint.get("identity") == obligation.payload.get("identity")
+                && constraint.get("reference_id") == obligation.payload.get("reference_id")
+                && obligation.payload.get("service").and_then(Value::as_str)
+                    == Some("amaterasu.virtual-display/1");
+        }
+        if let Some(constraint) = physical_constraint {
+            return obligation.payload.get("service").and_then(Value::as_str)
+                == Some("amaterasu.display/1")
+                && constraint
+                    .get("configuration")
+                    .and_then(|v| v.get("displays"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|displays| {
+                        displays.iter().any(|display| {
+                            display.get("id").and_then(Value::as_str)
+                                == Some(obligation.resource_id.as_str())
+                        })
+                    });
+        }
+        false
+    });
+    if valid {
+        Ok(plan.obligations.clone())
+    } else {
+        Err("unowned_cleanup_obligation")
+    }
+}
+#[derive(Default)]
+struct LiveEffectGuard {
+    current: Option<(
+        crate::virtual_callback::EffectKind,
+        u64,
+        PendingVerification,
+    )>,
+}
+impl crate::virtual_callback::EffectGuard for LiveEffectGuard {
+    fn poll(
+        &mut self,
+        request: &ProviderRequest,
+        effect: crate::virtual_callback::EffectKind,
+        parent: u64,
+        now_ms: u64,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+    ) -> crate::virtual_callback::GuardProgress {
+        use crate::virtual_callback::GuardProgress;
+        if self.current.is_none() {
+            let Ok(verification) =
+                PendingVerification::from_request(LIFECYCLE_CALLER, request, now_ms)
+            else {
+                return GuardProgress::Unknown;
+            };
+            self.current = Some((effect, parent, verification));
+        }
+        let (active_effect, active_parent, verification) =
+            self.current.as_mut().expect("initialized");
+        if *active_effect != effect || *active_parent != parent {
+            self.current = None;
+            return GuardProgress::Unknown;
+        }
+        match verification.poll(now_ms, send) {
+            Verification::Pending => GuardProgress::Waiting,
+            Verification::Rejected => {
+                self.current = None;
+                GuardProgress::Rejected
+            }
+            Verification::Unknown => {
+                self.current = None;
+                GuardProgress::Unknown
+            }
+            Verification::Verified => {
+                self.current = None;
+                if matches!(
+                    send(Command::CheckRequest { request: parent }),
+                    Ok(Response::Ok)
+                ) {
+                    GuardProgress::Authorized
+                } else {
+                    GuardProgress::Unknown
+                }
+            }
+        }
+    }
+}
+fn start_effect(request: Box<ProviderRequest>) -> Result<PendingPhase, &'static str> {
+    use crate::durable_store::{StateDurableStore, VerifiedTarget, VirtualDurableStateStore};
+    use crate::receipt_store::VerifiedEpoch;
+    // This function is called only after full coordinator request verification.
+    admitted_obligations(&request)?;
+    let epoch = VerifiedEpoch::authenticate(target_epoch(&request.target).to_owned(), |_| true)?;
+    let target = VerifiedTarget::authenticate(target_store_key(&request.target)?, |_| true)?;
+    let prefix = format!("display.{}", request.provider_sequence);
+    let timeout = request.remaining_ms.min(30_000);
+    let constraints = &request
+        .approved_plan
+        .as_ref()
+        .ok_or("missing_plan")?
+        .constraints;
+    let physical = constraints.get("physical").is_some();
+    let virtual_display = constraints.get("virtual_display").is_some();
+    match (physical, virtual_display) {
+        (true, false) => {
+            let mut store = StateDurableStore::new(epoch, target, prefix, None, timeout)?;
+            store.start_load()?;
+            Ok(PendingPhase::PhysicalLoad {
+                request,
+                store: Box::new(store),
+            })
+        }
+        (false, true) => {
+            let mut store = VirtualDurableStateStore::new(epoch, target, prefix, None, timeout)?;
+            store.start_load()?;
+            Ok(PendingPhase::VirtualLoad {
+                request,
+                store: Box::new(store),
+            })
+        }
+        _ => Err("unsupported_or_ambiguous_plan"),
+    }
+}
+fn start_binding(
+    request: Box<crate::virtual_callback::BindingValidationRequest>,
+    id: u64,
+    timeout_ms: u64,
+) -> Result<PendingPhase, &'static str> {
+    use crate::durable_store::{VerifiedTarget, VirtualDurableStateStore};
+    use crate::receipt_store::VerifiedEpoch;
+    // The broker-authenticated lifecycle caller selects the exact target. The
+    // store reads only that target; BindingValidator compares the saved borrow,
+    // binding, mode, provider and independent observation before use.
+    let epoch = VerifiedEpoch::authenticate(target_epoch(&request.target).to_owned(), |_| true)?;
+    let target = VerifiedTarget::authenticate(target_store_key(&request.target)?, |_| true)?;
+    let timeout_ms = timeout_ms.min(30_000);
+    let mut store =
+        VirtualDurableStateStore::new(epoch, target, format!("binding.{id}"), None, timeout_ms)?;
+    store.start_load()?;
+    Ok(PendingPhase::BindingLoad {
+        request,
+        store: Box::new(store),
+        timeout_ms,
+    })
+}
+fn receipt_response(request: &ProviderRequest, receipt: &crate::receipt_store::Receipt) -> Value {
+    let crate::receipt_store::ReceiptState::Completed { result } = &receipt.state else {
+        return recovery("pending_or_interrupted_effect");
+    };
+    let Some(plan) = request.approved_plan.as_ref() else {
+        return recovery("missing_recorded_plan");
+    };
+    let Ok(obligations) = admitted_obligations(request) else {
+        return recovery("unowned_cleanup_obligation");
+    };
+    if plan.constraints.get("virtual_display").is_some() {
+        match serde_json::from_value::<crate::virtual_callback::CallbackResult>(result.clone()) {
+            Ok(crate::virtual_callback::CallbackResult::Released) => cleanup(&obligations),
+            Ok(crate::virtual_callback::CallbackResult::Rejected { reason }) => rejected(&reason),
+            // A saved candidate does not establish that its borrow is still live.
+            _ => recovery("binding_revalidation_required"),
+        }
+    } else if plan.constraints.get("physical").is_some() {
+        match serde_json::from_value::<crate::physical_callback::CallbackResult>(result.clone()) {
+            Ok(crate::physical_callback::CallbackResult::Restored { .. }) => cleanup(&obligations),
+            Ok(crate::physical_callback::CallbackResult::Rejected { reason }) => rejected(&reason),
+            _ => recovery("physical_revalidation_required"),
+        }
+    } else {
+        recovery("unsupported_recorded_plan")
+    }
+}
+fn preparing(request: &ProviderRequest) -> bool {
+    matches!(
+        request.phase,
+        LifecyclePhase::SessionPrepare | LifecyclePhase::StreamPrepare
+    )
+}
+fn advance_phase(
+    phase: PendingPhase,
+    request_id: u64,
+    now_ms: u64,
+    send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+) -> Result<PendingPhase, Value> {
+    use crate::durable_store::LoadProgress;
+    match phase {
+        PendingPhase::Plan { mut planner } => match planner.poll(now_ms, send) {
+            crate::resource_plan::PlanProgress::Waiting => Ok(PendingPhase::Plan { planner }),
+            crate::resource_plan::PlanProgress::Complete(response) => {
+                Err(serde_json::to_value(response)
+                    .unwrap_or_else(|_| recovery("invalid_plan_response")))
+            }
+            crate::resource_plan::PlanProgress::Unknown => {
+                Err(recovery("resource_planning_unknown"))
+            }
+        },
+        PendingPhase::StatusLookup { status, mut lookup } => match lookup.poll(now_ms, send) {
+            crate::durable_store::PriorReceiptProgress::Waiting => {
+                Ok(PendingPhase::StatusLookup { status, lookup })
+            }
+            crate::durable_store::PriorReceiptProgress::Expired => Err(recovery("receipt_expired")),
+            crate::durable_store::PriorReceiptProgress::Unknown => {
+                Err(recovery("receipt_lookup_unknown"))
+            }
+            crate::durable_store::PriorReceiptProgress::Found { receipt, request } => {
+                if request.transition_id != status.transition_id {
+                    return Err(recovery("receipt_identity_mismatch"));
+                }
+                let verification =
+                    PendingVerification::from_request(LIFECYCLE_CALLER, &request, now_ms)
+                        .map_err(|_| recovery("receipt_verification_unavailable"))?;
+                Ok(PendingPhase::StatusVerify {
+                    request,
+                    receipt: Box::new(receipt),
+                    verification: Box::new(verification),
+                })
+            }
+        },
+        PendingPhase::StatusVerify {
+            request,
+            receipt,
+            mut verification,
+        } => match verification.poll(now_ms, send) {
+            Verification::Pending => Ok(PendingPhase::StatusVerify {
+                request,
+                receipt,
+                verification,
+            }),
+            Verification::Verified => Err(receipt_response(&request, &receipt)),
+            _ => Err(recovery("receipt_verification_unknown")),
+        },
+        PendingPhase::Verify {
+            request,
+            mut verification,
+        } => match verification.poll(now_ms, send) {
+            Verification::Pending => Ok(PendingPhase::Verify {
+                request,
+                verification,
+            }),
+            Verification::Rejected => Err(rejected("coordinator_verification_rejected")),
+            Verification::Unknown => Err(recovery("coordinator_verification_unknown")),
+            Verification::Verified => {
+                if request.operation == ProviderOperation::ResourcePlan {
+                    let planner = crate::resource_plan::Planner::new(
+                        LIFECYCLE_CALLER,
+                        *request,
+                        Some(request_id),
+                        now_ms,
+                        |_| true,
+                    )
+                    .map_err(rejected)?;
+                    return Ok(PendingPhase::Plan {
+                        planner: Box::new(planner),
+                    });
+                }
+                if !effect_recovery_available() {
+                    return Err(recovery("effect_path_not_qualified"));
+                }
+                if !matches!(
+                    send(Command::CheckRequest {
+                        request: request_id
+                    }),
+                    Ok(Response::Ok)
+                ) {
+                    return Err(recovery("request_ended_before_effect"));
+                }
+                start_effect(request).map_err(rejected)
+            }
+        },
+        PendingPhase::PhysicalLoad { request, mut store } => {
+            store.advance(now_ms, send);
+            let prior = match store.poll_load() {
+                LoadProgress::Waiting => return Ok(PendingPhase::PhysicalLoad { request, store }),
+                LoadProgress::Found(prior) if !preparing(&request) => Some(prior),
+                LoadProgress::Found(prior) if preparing(&request) && prior.restored => None,
+                LoadProgress::Absent if preparing(&request) => None,
+                _ => return Err(recovery("obligation_reconciliation_required")),
+            };
+            let obligations = admitted_obligations(&request).map_err(rejected)?;
+            let parent = preparing(&request).then_some(request_id);
+            let machine = crate::physical_callback::PhysicalCallback::new(
+                LIFECYCLE_CALLER,
+                *request,
+                prior,
+                |_| true,
+                now_ms,
+                parent,
+            )
+            .map_err(rejected)?;
+            Ok(PendingPhase::Physical {
+                machine: Box::new(machine),
+                store,
+                obligations,
+                guard: Box::new(LiveEffectGuard::default()),
+            })
+        }
+        PendingPhase::VirtualLoad { request, mut store } => {
+            store.advance(now_ms, send);
+            let prior = match store.poll_load() {
+                LoadProgress::Waiting => return Ok(PendingPhase::VirtualLoad { request, store }),
+                LoadProgress::Found(prior) if !preparing(&request) => Some(prior),
+                LoadProgress::Found(prior)
+                    if preparing(&request)
+                        && prior.reference_released
+                        && prior.borrow.is_none() =>
+                {
+                    None
+                }
+                LoadProgress::Absent if preparing(&request) => None,
+                _ => return Err(recovery("obligation_reconciliation_required")),
+            };
+            let obligations = admitted_obligations(&request).map_err(rejected)?;
+            let parent = preparing(&request).then_some(request_id);
+            let machine = crate::virtual_callback::VirtualCallback::new(
+                LIFECYCLE_CALLER,
+                *request,
+                prior,
+                |_| true,
+                now_ms,
+                parent,
+            )
+            .map_err(rejected)?;
+            Ok(PendingPhase::Virtual {
+                machine: Box::new(machine),
+                store,
+                obligations,
+                guard: Box::new(LiveEffectGuard::default()),
+            })
+        }
+        PendingPhase::BindingLoad {
+            request,
+            mut store,
+            timeout_ms,
+        } => {
+            store.advance(now_ms, send);
+            let obligation = match store.poll_load() {
+                LoadProgress::Waiting => {
+                    return Ok(PendingPhase::BindingLoad {
+                        request,
+                        store,
+                        timeout_ms,
+                    });
+                }
+                LoadProgress::Found(obligation) => obligation,
+                _ => return Err(recovery("binding_obligation_unavailable")),
+            };
+            let validator = crate::virtual_callback::BindingValidator::new(
+                LIFECYCLE_CALLER,
+                *request,
+                obligation,
+                |_| true,
+                timeout_ms,
+                now_ms,
+            )
+            .map_err(rejected)?;
+            Ok(PendingPhase::Binding {
+                validator: Box::new(validator),
+                store,
+            })
+        }
+        PendingPhase::Binding {
+            mut validator,
+            mut store,
+        } => {
+            store.advance(now_ms, send);
+            match validator.poll(now_ms, send, &mut *store) {
+                None => Ok(PendingPhase::Binding { validator, store }),
+                Some(result) => Err(serde_json::to_value(result)
+                    .unwrap_or_else(|_| recovery("binding_result_invalid"))),
+            }
+        }
+        PendingPhase::Physical {
+            mut machine,
+            mut store,
+            obligations,
+            mut guard,
+        } => {
+            store.advance(now_ms, send);
+            match machine.poll(now_ms, send, &mut *store, &mut *guard) {
+                crate::physical_callback::CallbackProgress::Waiting => Ok(PendingPhase::Physical {
+                    machine,
+                    store,
+                    obligations,
+                    guard,
+                }),
+                crate::physical_callback::CallbackProgress::Complete(
+                    crate::physical_callback::CallbackResult::Applied { .. },
+                ) => Err(json!({"status":"prepared","candidate":null,"obligations":obligations})),
+                crate::physical_callback::CallbackProgress::Complete(
+                    crate::physical_callback::CallbackResult::Restored { .. },
+                ) => Err(cleanup(&obligations)),
+                crate::physical_callback::CallbackProgress::Complete(
+                    crate::physical_callback::CallbackResult::Rejected { reason },
+                ) => Err(rejected(&reason)),
+                _ => Err(recovery("physical_recovery_required")),
+            }
+        }
+        PendingPhase::Virtual {
+            mut machine,
+            mut store,
+            obligations,
+            mut guard,
+        } => {
+            store.advance(now_ms, send);
+            match machine.poll(now_ms, send, &mut *store, &mut *guard) {
+                crate::virtual_callback::CallbackProgress::Waiting => Ok(PendingPhase::Virtual {
+                    machine,
+                    store,
+                    obligations,
+                    guard,
+                }),
+                crate::virtual_callback::CallbackProgress::Complete(
+                    crate::virtual_callback::CallbackResult::Prepared {
+                        candidate,
+                        obligations,
+                    },
+                ) => Err(
+                    json!({"status":"prepared","candidate":candidate,"obligations":obligations}),
+                ),
+                crate::virtual_callback::CallbackProgress::Complete(
+                    crate::virtual_callback::CallbackResult::Released,
+                ) => Err(cleanup(&obligations)),
+                crate::virtual_callback::CallbackProgress::Complete(
+                    crate::virtual_callback::CallbackResult::Rejected { reason },
+                ) => Err(rejected(&reason)),
+                _ => Err(recovery("virtual_recovery_required")),
+            }
+        }
+    }
+}
+impl DisplaySettingsModule {
+    fn complete(&self, id: u64, payload: Value) -> ModuleResult<()> {
+        match self.runtime.send(Command::Complete {
+            request: id,
+            payload,
+        })? {
+            Response::Ok => Ok(()),
+            Response::Error { code, .. } if code == "request_ended" || code == "not_found" => {
+                Ok(())
+            }
+            _ => Err("display provider completion failed".into()),
+        }
+    }
+    fn advance(&mut self) -> ModuleResult<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let mut item = self.pending.remove(0);
+        let now = self.clock.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        match advance_phase(item.phase, item.request_id, now, &mut |command| {
+            self.runtime.send(command)
+        }) {
+            Ok(phase) => {
+                item.phase = phase;
+                self.pending.push(item);
+            }
+            Err(response) => self.complete(item.request_id, response)?,
+        }
+        Ok(())
+    }
+}
 impl ManagedModule for DisplaySettingsModule {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
-        runtime.require_success(registration())?;
-        Ok(Self { runtime })
+        for name in [
+            "settings_validate",
+            "resource_plan",
+            "lifecycle_callback",
+            "lifecycle_status",
+            "binding_validate",
+        ] {
+            runtime.require_success(registration(name))?;
+        }
+        Ok(Self {
+            runtime,
+            clock: Instant::now(),
+            pending: Vec::new(),
+        })
     }
-
     fn tick(&mut self) -> ModuleResult<()> {
+        self.advance()?;
         match self.runtime.send(Command::Poll {})? {
             Response::Pending => Ok(()),
             Response::Request {
@@ -95,6 +789,7 @@ impl ManagedModule for DisplaySettingsModule {
                 caller,
                 service,
                 payload,
+                remaining_ms,
                 ..
             } => {
                 if service != SERVICE
@@ -105,30 +800,95 @@ impl ManagedModule for DisplaySettingsModule {
                 {
                     return Ok(());
                 }
-                let response = validate_request(&caller, payload);
-                match self.runtime.send(Command::Complete {
-                    request: id,
-                    payload: response,
-                })? {
-                    Response::Ok => Ok(()),
-                    Response::Error { code, .. }
-                        if code == "request_ended" || code == "not_found" =>
-                    {
+                if arguments(&payload).is_some_and(|(method, _)| method == "settings_validate") {
+                    return self.complete(id, validate_request(&caller, payload));
+                }
+                let now = self.clock.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                match dispatch(&caller, &payload, now, remaining_ms) {
+                    Dispatch::Immediate(result) => self.complete(id, result),
+                    Dispatch::Verify(request, verification) if self.pending.len() < MAX_PENDING => {
+                        self.pending.push(PendingRequest {
+                            request_id: id,
+                            phase: PendingPhase::Verify {
+                                request,
+                                verification,
+                            },
+                        });
                         Ok(())
                     }
-                    _ => Err("settings validation completion failed".into()),
+                    Dispatch::Verify(_, _) => self.complete(id, rejected("provider_busy")),
+                    Dispatch::Binding(request) if self.pending.len() < MAX_PENDING => {
+                        match start_binding(request, id, remaining_ms) {
+                            Ok(phase) => {
+                                self.pending.push(PendingRequest {
+                                    request_id: id,
+                                    phase,
+                                });
+                                Ok(())
+                            }
+                            Err(reason) => self.complete(id, rejected(reason)),
+                        }
+                    }
+                    Dispatch::Binding(_) => self.complete(id, rejected("provider_busy")),
+                    Dispatch::Plan(request) if self.pending.len() < MAX_PENDING => {
+                        match crate::resource_plan::Planner::new(
+                            LIFECYCLE_CALLER,
+                            *request,
+                            Some(id),
+                            now,
+                            |_| true,
+                        ) {
+                            Ok(planner) => {
+                                self.pending.push(PendingRequest {
+                                    request_id: id,
+                                    phase: PendingPhase::Plan {
+                                        planner: Box::new(planner),
+                                    },
+                                });
+                                Ok(())
+                            }
+                            Err(reason) => self.complete(id, rejected(reason)),
+                        }
+                    }
+                    Dispatch::Plan(_) => self.complete(id, rejected("provider_busy")),
+
+                    Dispatch::Status(status) if self.pending.len() < MAX_PENDING => {
+                        let lookup = crate::durable_store::PriorReceiptLookup::new(
+                            LIFECYCLE_CALLER,
+                            status.provider_sequence,
+                            status.operation_id.clone(),
+                            format!("status.{id}"),
+                            None,
+                            remaining_ms.min(30_000),
+                            now,
+                        );
+                        match lookup {
+                            Ok(lookup) => {
+                                self.pending.push(PendingRequest {
+                                    request_id: id,
+                                    phase: PendingPhase::StatusLookup {
+                                        status,
+                                        lookup: Box::new(lookup),
+                                    },
+                                });
+                                Ok(())
+                            }
+                            Err(_) => self.complete(id, recovery("receipt_lookup_unavailable")),
+                        }
+                    }
+                    Dispatch::Status(_) => self.complete(id, rejected("provider_busy")),
                 }
             }
-            _ => Err("settings validation polling failed".into()),
+            _ => Err("display provider polling failed".into()),
         }
     }
 }
-
 amaterasu_module_sdk::export_module!(DisplaySettingsModule);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     #[test]
     fn validates_only_complete_settings_from_registry() {
         let values =
@@ -140,13 +900,193 @@ mod tests {
             true
         );
         assert_eq!(validate_request("untrusted", request)["valid"], false);
-        assert_eq!(
-            validate_request(
-                REGISTRY_CALLER,
-                json!({"method":"settings_validate","interface_major":1,"interface_minor":0,"arguments":{"values":{}}})
-            )["valid"],
-            false
+        for method in [
+            "settings_validate",
+            "resource_plan",
+            "lifecycle_callback",
+            "lifecycle_status",
+            "binding_validate",
+        ] {
+            assert!(matches!(registration(method), Command::RegisterApi { .. }));
+        }
+    }
+    #[test]
+    fn untrusted_and_unavailable_binding_never_authorize() {
+        let request = json!({"method":"binding_validate","interface_major":1,"interface_minor":0,"arguments":{}});
+        assert!(
+            matches!(dispatch("attacker",&request,0,100),Dispatch::Immediate(v) if v["status"]=="rejected")
         );
-        assert!(matches!(registration(), Command::RegisterApi { .. }));
+        assert!(
+            matches!(dispatch(LIFECYCLE_CALLER,&request,0,100),Dispatch::Immediate(v) if v["status"]=="rejected")
+        );
+    }
+    #[test]
+    #[ignore = "prints example operator approvals for packaging"]
+    fn print_example_api_approvals() {
+        let approvals: Vec<_> = [
+            "settings_validate",
+            "resource_plan",
+            "lifecycle_callback",
+            "lifecycle_status",
+            "binding_validate",
+        ]
+        .into_iter()
+        .map(|name| {
+            let Command::RegisterApi { method } = registration(name) else {
+                unreachable!()
+            };
+            let callers = if name == "settings_validate" {
+                vec![REGISTRY_CALLER, "amaterasu.management"]
+            } else {
+                vec![LIFECYCLE_CALLER]
+            };
+            json!({"provider":crate::descriptor::PROVIDER,"callers":callers,"method":method})
+        })
+        .collect();
+        println!("APPROVALS_JSON={}", json!({"api_methods":approvals}));
+    }
+    #[test]
+    fn target_key_preserves_full_uuid_identity_and_generation() {
+        let make = |generation| LifecycleTarget::Stream {
+            host_epoch: "12345678-1234-1234-1234-123456789abc".into(),
+            session_id: "12345678-1234-1234-1234-123456789abc".into(),
+            stream_id: "12345678-1234-1234-1234-123456789abc".into(),
+            generation,
+        };
+        let original = target_store_key(&make(7)).unwrap();
+        assert_eq!(original.len(), 71);
+        assert_eq!(original, target_store_key(&make(7)).unwrap());
+        assert_ne!(original, target_store_key(&make(8)).unwrap());
+        assert!(crate::durable_store::VerifiedTarget::authenticate(original, |_| true).is_ok());
+    }
+    #[test]
+    fn status_unknown_receipt_never_replays_or_reports_success() {
+        let status = ProviderStatusRequest {
+            provider_sequence: 1,
+            operation_id: "op-1".into(),
+            transition_id: "transition-1".into(),
+            receipt_id: "op-1".into(),
+        };
+        let lookup = crate::durable_store::PriorReceiptLookup::new(
+            LIFECYCLE_CALLER,
+            1,
+            "op-1".into(),
+            "status.1".into(),
+            None,
+            100,
+            0,
+        )
+        .unwrap();
+        let mut calls = VecDeque::from([
+            Response::Accepted { id: 2 },
+            Response::Result {
+                payload: json!({"ok":true,"revision":0,"found":false,"count":0,"metadata":null}),
+            },
+            Response::Ok,
+        ]);
+        let mut send = |command| {
+            assert!(matches!(
+                command,
+                Command::Request { .. }
+                    | Command::TakeResult { .. }
+                    | Command::ReleaseResult { .. }
+            ));
+            Ok(calls.pop_front().unwrap())
+        };
+        let phase = PendingPhase::StatusLookup {
+            status: Box::new(status),
+            lookup: Box::new(lookup),
+        };
+        let phase = match advance_phase(phase, 77, 1, &mut send) {
+            Ok(phase) => phase,
+            Err(_) => panic!("unexpected completion"),
+        };
+        let phase = match advance_phase(phase, 77, 2, &mut send) {
+            Ok(phase) => phase,
+            Err(_) => panic!("unexpected completion"),
+        };
+        assert!(
+            matches!(advance_phase(phase,77,3,&mut send),Err(value) if value["status"]=="recovery_required")
+        );
+    }
+    #[test]
+    fn effect_guard_reverifies_each_submission_and_checks_live_parent() {
+        use crate::virtual_callback::{EffectGuard, EffectKind, GuardProgress};
+        let request: ProviderRequest = serde_json::from_value(json!({"provider_sequence":1,"operation":"resource_plan","version":1,"transition_id":"transition-1","operation_id":"op-1","target":{"kind":"validation","host_epoch":"epoch-1","validation_id":"validation-1","generation":1},"phase":"stream.prepare","settings_revision":"revision","settings":{},"intent":null,"reason":null,"requested_video":null,"consumer_requirements":{"execution_domain":"desktop","capture_providers":["capture"],"selector_schemas":["selector/1"]},"remaining_ms":100,"plan_revision":null,"admission_id":null,"approved_plan":null})).unwrap();
+        let mut guard = LiveEffectGuard::default();
+        let mut payload = Value::Null;
+        let mut transport_ids = Vec::new();
+        let mut send = |command| match command {
+            Command::Request {
+                payload: request,
+                operation_id,
+                ..
+            } => {
+                payload = request;
+                transport_ids.push(operation_id);
+                Ok(Response::Accepted { id: 1 })
+            }
+            Command::TakeResult { .. } => {
+                let mut reply = payload.clone();
+                reply["status"] = "succeeded".into();
+                Ok(Response::Result { payload: reply })
+            }
+            Command::ReleaseResult { .. } | Command::CheckRequest { request: 77 } => {
+                Ok(Response::Ok)
+            }
+            _ => panic!("unexpected command"),
+        };
+        for effect in [EffectKind::Create, EffectKind::Borrow] {
+            assert_eq!(
+                guard.poll(&request, effect, 77, 1, &mut send),
+                GuardProgress::Waiting
+            );
+            assert_eq!(
+                guard.poll(&request, effect, 77, 2, &mut send),
+                GuardProgress::Waiting
+            );
+            assert_eq!(
+                guard.poll(&request, effect, 77, 3, &mut send),
+                GuardProgress::Authorized
+            );
+        }
+        assert_eq!(transport_ids.len(), 2);
+        assert_ne!(transport_ids[0], transport_ids[1]);
+    }
+    #[test]
+    fn verified_plan_with_invalid_settings_does_not_dispatch() {
+        let request: ProviderRequest = serde_json::from_value(json!({"provider_sequence":1,"operation":"resource_plan","version":1,"transition_id":"transition-1","operation_id":"op-1","target":{"kind":"validation","host_epoch":"epoch-1","validation_id":"validation-1","generation":1},"phase":"stream.prepare","settings_revision":"revision","settings":{},"intent":null,"reason":null,"requested_video":null,"consumer_requirements":{"execution_domain":"desktop","capture_providers":["capture"],"selector_schemas":["selector/1"]},"remaining_ms":100,"plan_revision":null,"admission_id":null,"approved_plan":null})).unwrap();
+        let verify = PendingVerification::from_request(LIFECYCLE_CALLER, &request, 0).unwrap();
+        let mut reply = Value::Null;
+        let mut calls = VecDeque::from([0, 1, 2]);
+        let mut send = |command| match (calls.pop_front().unwrap(), command) {
+            (0, Command::Request { payload, .. }) => {
+                reply = payload;
+                Ok(Response::Accepted { id: 1 })
+            }
+            (1, Command::TakeResult { .. }) => {
+                reply["status"] = "succeeded".into();
+                Ok(Response::Result {
+                    payload: reply.clone(),
+                })
+            }
+            (2, Command::ReleaseResult { .. }) => Ok(Response::Ok),
+            _ => panic!("unexpected native or state call"),
+        };
+        let phase = PendingPhase::Verify {
+            request: Box::new(request),
+            verification: Box::new(verify),
+        };
+        let phase = match advance_phase(phase, 77, 1, &mut send) {
+            Ok(phase) => phase,
+            Err(_) => panic!("unexpected completion"),
+        };
+        let phase = match advance_phase(phase, 77, 2, &mut send) {
+            Ok(phase) => phase,
+            Err(_) => panic!("unexpected completion"),
+        };
+        assert!(
+            matches!(advance_phase(phase, 77, 3, &mut send),Err(response) if response["status"]=="rejected")
+        );
     }
 }

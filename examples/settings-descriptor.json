@@ -3,6 +3,28 @@
   "revision": 1,
   "options": [
     {
+      "id": "display_target",
+      "label": "display target",
+      "help": "Applied on a future session after provider support is verified.",
+      "definition": {
+        "type": "enum",
+        "default": "virtual",
+        "options": [
+          "virtual",
+          "physical"
+        ]
+      },
+      "presentation": null,
+      "allowed_scopes": [
+        "host",
+        "application",
+        "paired_client",
+        "session"
+      ],
+      "apply_policy": "next_session",
+      "required_capabilities": []
+    },
+    {
       "id": "enabled",
       "label": "enabled",
       "help": "Applied on a future session after provider support is verified.",
@@ -135,6 +157,48 @@
           "extended_primary",
           "extended_isolated",
           "extended_primary_isolated"
+        ]
+      },
+      "presentation": null,
+      "allowed_scopes": [
+        "host",
+        "application",
+        "paired_client",
+        "session"
+      ],
+      "apply_policy": "next_session",
+      "required_capabilities": []
+    },
+    {
+      "id": "physical_display_id",
+      "label": "physical display id",
+      "help": "Applied on a future session after provider support is verified.",
+      "definition": {
+        "type": "string",
+        "default": "",
+        "min_length": 0,
+        "max_length": 1024
+      },
+      "presentation": null,
+      "allowed_scopes": [
+        "host",
+        "application",
+        "paired_client",
+        "session"
+      ],
+      "apply_policy": "next_session",
+      "required_capabilities": []
+    },
+    {
+      "id": "physical_target",
+      "label": "physical target",
+      "help": "Applied on a future session after provider support is verified.",
+      "definition": {
+        "type": "enum",
+        "default": "automatic",
+        "options": [
+          "automatic",
+          "identifier"
         ]
       },
       "presentation": null,

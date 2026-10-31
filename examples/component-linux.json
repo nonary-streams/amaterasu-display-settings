@@ -6,6 +6,18 @@
   "size": 0,
   "abi_major": 1,
   "runtime": false,
-  "requires": {"amaterasu.runtime": "0.1.0"},
-  "requested": {"provide": ["nonary.display-settings/1"]}
+  "requires": {
+    "amaterasu.runtime": "0.1.0"
+  },
+  "requested": {
+    "provide": [
+      "nonary.display-settings/1"
+    ],
+    "call": [
+      "amaterasu.state/1",
+      "amaterasu.session-lifecycle/1",
+      "amaterasu.display/1",
+      "amaterasu.virtual-display/1"
+    ]
+  }
 }

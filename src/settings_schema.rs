@@ -20,6 +20,22 @@ pub fn definitions() -> Fields {
     [
         ("enabled", Definition::Boolean { default: false }),
         (
+            "display_target",
+            choices("virtual", &["virtual", "physical"]),
+        ),
+        (
+            "physical_target",
+            choices("automatic", &["automatic", "identifier"]),
+        ),
+        (
+            "physical_display_id",
+            Definition::String {
+                default: String::new(),
+                min_length: Some(0),
+                max_length: Some(1024),
+            },
+        ),
+        (
             "resolution",
             choices("preserve", &["preserve", "client", "manual"]),
         ),

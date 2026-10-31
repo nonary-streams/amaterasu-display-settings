@@ -4,10 +4,14 @@ pub mod actions;
 pub mod policy;
 pub mod settings;
 
+pub mod coordinator;
 pub mod descriptor;
+pub mod durable_store;
 mod module;
 pub mod physical_callback;
 pub mod physical_display;
 pub mod receipt_store;
+pub mod resource_plan;
 pub mod settings_schema;
+pub mod virtual_callback;
 pub mod virtual_display;
