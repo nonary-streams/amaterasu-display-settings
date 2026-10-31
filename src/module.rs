@@ -17,6 +17,13 @@ const SERVICE: &str = "nonary.display-settings/1";
 const REGISTRY_CALLER: &str = "amaterasu.extension-registry";
 const LIFECYCLE_CALLER: &str = "amaterasu.session-lifecycle";
 const MAX_PENDING: usize = 32;
+const REGISTERED_METHODS: &[&str] = &[
+    "settings_validate",
+    "resource_plan",
+    "lifecycle_callback",
+    "lifecycle_status",
+    "binding_validate",
+];
 
 pub struct DisplaySettingsModule {
     runtime: RuntimeClient,
@@ -184,7 +191,6 @@ fn registration(method: &str) -> Command {
                 ("transition_id", Kind::String),
                 ("target", Kind::Object),
                 ("plan_revision", Kind::Integer),
-                ("borrow_id", Kind::String),
                 ("binding", Kind::Object),
                 ("observation", Kind::Object),
             ],
@@ -1140,7 +1146,6 @@ fn advance_phase(
                 transition_id: request.transition_id.clone(),
                 target: request.target.clone(),
                 plan_revision: candidate.plan_revision,
-                borrow_id: borrow.borrow_id.clone(),
                 binding: (*candidate).clone(),
                 observation: borrow.observed_output.clone(),
             };
@@ -1537,13 +1542,7 @@ impl DisplaySettingsModule {
 }
 impl ManagedModule for DisplaySettingsModule {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
-        for name in [
-            "settings_validate",
-            "resource_plan",
-            "lifecycle_callback",
-            "lifecycle_status",
-            "binding_validate",
-        ] {
+        for &name in REGISTERED_METHODS {
             runtime.require_success(registration(name))?;
         }
         Ok(Self {
@@ -1728,28 +1727,48 @@ mod tests {
         );
     }
     #[test]
+    fn checked_in_approvals_match_registered_method_contracts() {
+        let actual: Value =
+            serde_json::from_str(include_str!("../examples/lifecycle-api-approvals.json")).unwrap();
+        let expected: Vec<Value> = REGISTERED_METHODS
+            .iter()
+            .copied()
+            .map(|name| {
+                let Command::RegisterApi { method } = registration(name) else {
+                    unreachable!()
+                };
+                let callers = if name == "settings_validate" {
+                    vec![REGISTRY_CALLER, "amaterasu.management"]
+                } else if name.starts_with("action_") {
+                    vec![crate::action_provider::ACTION_CALLER]
+                } else {
+                    vec![LIFECYCLE_CALLER]
+                };
+                json!({"provider":crate::descriptor::PROVIDER,"callers":callers,"method":method})
+            })
+            .collect();
+        assert_eq!(actual, json!({"api_methods":expected}));
+    }
+    #[test]
     #[ignore = "prints example operator approvals for packaging"]
     fn print_example_api_approvals() {
-        let approvals: Vec<_> = [
-            "settings_validate",
-            "resource_plan",
-            "lifecycle_callback",
-            "lifecycle_status",
-            "binding_validate",
-        ]
-        .into_iter()
-        .map(|name| {
-            let Command::RegisterApi { method } = registration(name) else {
-                unreachable!()
-            };
-            let callers = if name == "settings_validate" {
-                vec![REGISTRY_CALLER, "amaterasu.management"]
-            } else {
-                vec![LIFECYCLE_CALLER]
-            };
-            json!({"provider":crate::descriptor::PROVIDER,"callers":callers,"method":method})
-        })
-        .collect();
+        let approvals: Vec<_> = REGISTERED_METHODS
+            .iter()
+            .copied()
+            .map(|name| {
+                let Command::RegisterApi { method } = registration(name) else {
+                    unreachable!()
+                };
+                let callers = if name == "settings_validate" {
+                    vec![REGISTRY_CALLER, "amaterasu.management"]
+                } else if name.starts_with("action_") {
+                    vec![crate::action_provider::ACTION_CALLER]
+                } else {
+                    vec![LIFECYCLE_CALLER]
+                };
+                json!({"provider":crate::descriptor::PROVIDER,"callers":callers,"method":method})
+            })
+            .collect();
         println!("APPROVALS_JSON={}", json!({"api_methods":approvals}));
     }
     fn callback_request() -> ProviderRequest {

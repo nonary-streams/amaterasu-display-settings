@@ -961,7 +961,6 @@ mod tests {
             transition_id: "transition-1".into(),
             target: request().target,
             plan_revision: 1,
-            borrow_id: owned.borrow_id.clone(),
             binding,
             observation: owned.observed_output.clone(),
         };
@@ -1087,7 +1086,6 @@ pub struct BindingValidationRequest {
     pub transition_id: String,
     pub target: LifecycleTarget,
     pub plan_revision: u64,
-    pub borrow_id: String,
     pub binding: CaptureBinding,
     pub observation: wire::ObservedOutput,
 }
@@ -1136,7 +1134,6 @@ impl BindingValidator {
         let borrow = obligation.borrow.as_ref().ok_or("missing_borrow")?;
         if obligation.provider_service != wire::SERVICE
             || obligation.reference_released
-            || request.borrow_id != borrow.borrow_id
             || request.binding.resource.provider != crate::descriptor::PROVIDER
             || request.binding.resource.resource_id != obligation.identity
             || request.binding.resource.incarnation
