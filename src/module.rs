@@ -31,6 +31,11 @@ enum PendingPhase {
     Plan {
         planner: Box<crate::resource_plan::Planner>,
     },
+    PlanSessionLoad {
+        planner: Box<crate::resource_plan::Planner>,
+        target: LifecycleTarget,
+        store: Box<crate::durable_store::VirtualDurableStateStore>,
+    },
     StatusLookup {
         status: Box<ProviderStatusRequest>,
         lookup: Box<crate::durable_store::PriorReceiptLookup>,
@@ -224,7 +229,6 @@ enum Dispatch {
     Immediate(Value),
     Verify(Box<ProviderRequest>, Box<PendingVerification>),
     Binding(Box<crate::virtual_callback::BindingValidationRequest>),
-    Plan(Box<ProviderRequest>),
     Status(Box<ProviderStatusRequest>),
 }
 fn dispatch(caller: &str, payload: &Value, now_ms: u64, remaining_ms: u64) -> Dispatch {
@@ -251,9 +255,6 @@ fn dispatch(caller: &str, payload: &Value, now_ms: u64, remaining_ms: u64) -> Di
             }
             if remaining_ms == 0 {
                 return Dispatch::Immediate(rejected("request_ended"));
-            }
-            if request.operation == ProviderOperation::ResourcePlan {
-                return Dispatch::Plan(Box::new(request));
             }
             match PendingVerification::from_request(caller, &request, now_ms) {
                 Ok(verification) => Dispatch::Verify(Box::new(request), Box::new(verification)),
@@ -495,6 +496,32 @@ fn advance_phase(
 ) -> Result<PendingPhase, Value> {
     use crate::durable_store::LoadProgress;
     match phase {
+        PendingPhase::PlanSessionLoad {
+            mut planner,
+            target,
+            mut store,
+        } => {
+            store.advance(now_ms, send);
+            match store.poll_load() {
+                LoadProgress::Waiting => Ok(PendingPhase::PlanSessionLoad {
+                    planner,
+                    target,
+                    store,
+                }),
+                LoadProgress::Found(obligation) => {
+                    let session = crate::resource_plan::VerifiedSessionDisplay::authenticate(
+                        target,
+                        obligation,
+                        |_, _| true,
+                    )
+                    .map_err(rejected)?;
+                    planner.attach_session(session, now_ms).map_err(rejected)?;
+                    Ok(PendingPhase::Plan { planner })
+                }
+                LoadProgress::Absent => Err(rejected("session_ownership_unverified")),
+                LoadProgress::Unknown => Err(recovery("session_ownership_unknown")),
+            }
+        }
         PendingPhase::Plan { mut planner } => match planner.poll(now_ms, send) {
             crate::resource_plan::PlanProgress::Waiting => Ok(PendingPhase::Plan { planner }),
             crate::resource_plan::PlanProgress::Complete(response) => {
@@ -661,6 +688,15 @@ fn advance_phase(
             Verification::Unknown => Err(recovery("coordinator_verification_unknown")),
             Verification::Verified => {
                 if request.operation == ProviderOperation::ResourcePlan {
+                    let needs_session = matches!(request.target, LifecycleTarget::Stream { .. })
+                        && request
+                            .settings
+                            .get("display_target")
+                            .and_then(Value::as_str)
+                            .unwrap_or("virtual")
+                            == "virtual";
+                    let session_target = verification.session_target().cloned();
+                    let timeout = request.remaining_ms.min(30_000);
                     let planner = crate::resource_plan::Planner::new(
                         LIFECYCLE_CALLER,
                         *request,
@@ -669,6 +705,34 @@ fn advance_phase(
                         |_| true,
                     )
                     .map_err(rejected)?;
+                    if needs_session {
+                        let target =
+                            session_target.ok_or_else(|| recovery("session_target_unavailable"))?;
+                        let epoch = crate::receipt_store::VerifiedEpoch::authenticate(
+                            target_epoch(&target).to_owned(),
+                            |_| true,
+                        )
+                        .map_err(rejected)?;
+                        let key = crate::durable_store::VerifiedTarget::authenticate(
+                            target_store_key(&target).map_err(rejected)?,
+                            |_| true,
+                        )
+                        .map_err(rejected)?;
+                        let mut store = crate::durable_store::VirtualDurableStateStore::new(
+                            epoch,
+                            key,
+                            format!("plansession.{request_id}"),
+                            Some(request_id),
+                            timeout,
+                        )
+                        .map_err(rejected)?;
+                        store.start_load().map_err(rejected)?;
+                        return Ok(PendingPhase::PlanSessionLoad {
+                            planner: Box::new(planner),
+                            target,
+                            store: Box::new(store),
+                        });
+                    }
                     return Ok(PendingPhase::Plan {
                         planner: Box::new(planner),
                     });
@@ -943,28 +1007,6 @@ impl ManagedModule for DisplaySettingsModule {
                         }
                     }
                     Dispatch::Binding(_) => self.complete(id, rejected("provider_busy")),
-                    Dispatch::Plan(request) if self.pending.len() < MAX_PENDING => {
-                        match crate::resource_plan::Planner::new(
-                            LIFECYCLE_CALLER,
-                            *request,
-                            Some(id),
-                            now,
-                            |_| true,
-                        ) {
-                            Ok(planner) => {
-                                self.pending.push(PendingRequest {
-                                    request_id: id,
-                                    phase: PendingPhase::Plan {
-                                        planner: Box::new(planner),
-                                    },
-                                });
-                                Ok(())
-                            }
-                            Err(reason) => self.complete(id, rejected(reason)),
-                        }
-                    }
-                    Dispatch::Plan(_) => self.complete(id, rejected("provider_busy")),
-
                     Dispatch::Status(status) if self.pending.len() < MAX_PENDING => {
                         let lookup = crate::durable_store::PriorReceiptLookup::new(
                             LIFECYCLE_CALLER,
@@ -1138,6 +1180,13 @@ mod tests {
                     } else if service == "amaterasu.session-lifecycle/1" {
                         let mut answer = payload;
                         answer["status"] = "succeeded".into();
+                        match answer["target"]["kind"].as_str() {
+                            Some("session") => answer["session_target"] = answer["target"].clone(),
+                            Some("stream") => {
+                                answer["session_target"] = json!({"kind":"session","host_epoch":answer["target"]["host_epoch"],"session_id":answer["target"]["session_id"],"generation":1})
+                            }
+                            _ => {}
+                        }
                         answer
                     } else if service == "amaterasu.virtual-display/1" {
                         let action = payload["action"].as_str().unwrap();
@@ -1282,6 +1331,71 @@ mod tests {
         assert_eq!(response["status"], "recovery_required");
         assert!(broker.effects.is_empty());
         assert_eq!(broker.metadata["pending"], 1);
+    }
+    #[test]
+    fn stream_plan_requires_and_revalidates_coordinator_selected_session_journal() {
+        let mut request = callback_request();
+        request.operation = ProviderOperation::ResourcePlan;
+        request.plan_revision = None;
+        request.admission_id = None;
+        request.approved_plan = None;
+        request.requested_video = Some(
+            serde_json::from_value(
+                json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false}),
+            )
+            .unwrap(),
+        );
+        request.settings =
+            amaterasu_configuration_schema::defaults(&crate::settings_schema::definitions())
+                .unwrap();
+        request.settings.insert("enabled".into(), json!(true));
+        let mut missing = FakeBroker::default();
+        let result = missing.drive_effect(request.clone());
+        assert_eq!(result["reason"], "session_ownership_unverified");
+        assert!(missing.effects.is_empty());
+
+        let mut broker = FakeBroker::default();
+        assert_eq!(
+            broker.drive_effect(callback_request())["status"],
+            "prepared"
+        );
+        let mut obligation = broker
+            .values
+            .values()
+            .find(|v| v.get("reference_released").is_some())
+            .unwrap()
+            .clone();
+        obligation["identity"] = json!("6f410583-4b76-5ba6-bf99-0745617106eb");
+        let session = LifecycleTarget::Session {
+            host_epoch: "epoch-1".into(),
+            session_id: "session-1".into(),
+            generation: 1,
+        };
+        broker.values.insert(
+            format!(
+                "virtual-obligation/v1/{}",
+                target_store_key(&session).unwrap()
+            ),
+            obligation,
+        );
+        broker.effects.clear();
+        let verify = PendingVerification::from_request(LIFECYCLE_CALLER, &request, 0).unwrap();
+        let mut phase = PendingPhase::Verify {
+            request: Box::new(request),
+            verification: Box::new(verify),
+        };
+        for tick in 1..100 {
+            phase = advance_phase(phase, 77, tick, &mut |cmd| broker.send(cmd))
+                .unwrap_or_else(|v| panic!("unexpected result {v}"));
+            if broker
+                .effects
+                .iter()
+                .any(|effect| effect == "validate_borrow")
+            {
+                return;
+            }
+        }
+        panic!("session borrow was not validated");
     }
     #[test]
     fn target_key_preserves_full_uuid_identity_and_generation() {
