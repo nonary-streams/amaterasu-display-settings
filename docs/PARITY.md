@@ -12,6 +12,16 @@ producer and end-to-end platform qualification remain outstanding. Linux and Win
 native mode, capture, restore, HDR, scaling and compositor behavior require live
 validation. The composition path and migration tooling are still being integrated.
 
+The settings participant configures and restores per stream; session phases do
+not mutate the target. It compares known preserved HDR, scale and layout values,
+and requires an owner-confirmed, snapshot-bound native preservation proof for
+unknown values. Current composed mode configuration is SDR with preserved HDR
+and scale and selected virtual layouts; unsupported requests fail closed. The native Linux mode-only path has
+source and fake-backend test coverage, not live KScreen or hardware qualification.
+There is no v2 physical target producer yet. Revision-1 combined settings and
+owned resources require explicit export, review and retirement before a fresh
+profile is enabled; no automatic migration or lease adoption is performed.
+
 ## Historical baseline: public services and ownership
 
 | Service | Operations and current behavior | Sources |

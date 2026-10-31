@@ -10,6 +10,14 @@ The policy validates requested modes, scaling, HDR and layout. Native changes
 require coordinator admission and a selected resource owner. This plugin does
 not create, retain or remove virtual screens.
 
+Configuration is stream-scoped: the owner establishes the resource for the
+session, then each stream proposes configuration and restoration. For preserved
+HDR, scale and layout, known before/after values must match. Unknown values
+require the owner's matching native preservation digests bound to the exact
+configuration snapshot; absent or invalid proof is rejected. The current
+composed path supports SDR mode changes, preserved HDR and scale, and selected
+virtual layouts; unsupported HDR, scaling and mode-selection requests fail closed.
+
 ## Local development
 
 Check out Amaterasu as `../amaterasu`; the module SDK dependency currently uses
@@ -22,10 +30,10 @@ No private Amaterasu Rust crates are imported directly.
 No local build or unit test modifies displays. Tests do not establish that native
 mode setting, recovery, capture binding, or either platform works on hardware.
 
-The composed planner supports physical targets when a compatible v2 resource
-producer exists. Linux and Windows native behavior and complete streaming still
-require integration and hardware qualification. Unknown operations remain fenced
-for coordinator reconciliation.
+The composed planner accepts physical targets from a compatible v2 resource
+producer, but no such physical producer is available yet. Linux and Windows
+native behavior and complete streaming still require integration and hardware
+qualification. Unknown operations remain fenced for coordinator reconciliation.
 
 `examples/component-linux.json` is a component-manifest template; the packager
 replaces its hash and size. `examples/lifecycle-api-approvals.json` shows the
