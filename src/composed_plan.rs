@@ -135,8 +135,16 @@ pub fn plan_composed(request: &ProviderRequest) -> Result<ResourcePlan, &'static
     }
     let prepare = matches!(request.phase, LifecyclePhase::StreamPrepare);
     let arguments = if prepare {
-        if data["control_state"] != "unconfigured" || !data["snapshot_id"].is_null() {
-            return Err("display_target_already_configured");
+        match data["control_state"].as_str() {
+            Some("unconfigured") if data["snapshot_id"].is_null() => {}
+            // The coordinator authenticates this exact handoff and its previous
+            // release before dispatching the request to the planner.
+            Some("restored")
+                if data["snapshot_id"]
+                    .as_str()
+                    .is_some_and(|snapshot| !snapshot.is_empty() && snapshot.len() <= 128)
+                    && crate::composition_callback::valid_preservation_proof(data) => {}
+            _ => return Err("display_target_already_configured"),
         }
         composed_configure(request, &settings, data)?
     } else {
@@ -345,6 +353,43 @@ mod tests {
             plan.control_proposals[0].arguments,
             json!({"operation":"restore","snapshot_id":"snapshot-1"})
         );
+    }
+    #[test]
+    fn restored_handoff_can_be_configured_again_only_with_matching_proof() {
+        let mut request = composed_request();
+        request.intent = Some(extension_api::StreamIntent::Resume);
+        let data = &mut request.dependency_inputs[0].data;
+        data["control_state"] = json!("restored");
+        data["snapshot_id"] = json!("snapshot-1");
+        data["preservation_proof"] = json!({"kind":"mode_only_preserved","snapshot_id":"snapshot-1","before_digest":"a".repeat(64),"after_digest":"a".repeat(64)});
+        let plan = plan_composed(&request).unwrap();
+        assert_eq!(
+            plan.control_proposals[0].arguments["operation"],
+            "configure"
+        );
+        for (field, value) in [
+            ("snapshot_id", json!(null)),
+            ("snapshot_id", json!("")),
+            ("snapshot_id", json!("x".repeat(129))),
+            ("control_state", json!("configured")),
+            ("control_state", json!("recovery_required")),
+            ("preservation_proof", json!(null)),
+            (
+                "preservation_proof",
+                json!({"kind":"mode_only_preserved","snapshot_id":"other","before_digest":"a".repeat(64),"after_digest":"a".repeat(64)}),
+            ),
+            (
+                "preservation_proof",
+                json!({"kind":"mode_only_preserved","snapshot_id":"snapshot-1","before_digest":"a".repeat(64),"after_digest":"b".repeat(64)}),
+            ),
+        ] {
+            let mut invalid = request.clone();
+            invalid.dependency_inputs[0].data[field] = value;
+            assert_eq!(
+                plan_composed(&invalid),
+                Err("display_target_already_configured")
+            );
+        }
     }
     #[test]
     fn session_phases_do_not_configure_or_restore_stream_settings() {

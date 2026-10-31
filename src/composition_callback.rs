@@ -257,7 +257,7 @@ fn preserved<T: PartialEq>(before: Option<T>, after: Option<T>, proof: bool) -> 
     }
 }
 
-fn valid_preservation_proof(output: &serde_json::Value) -> bool {
+pub(crate) fn valid_preservation_proof(output: &serde_json::Value) -> bool {
     let Some(proof) = output.get("preservation_proof") else {
         return false;
     };
