@@ -224,6 +224,7 @@ fn advance_request(
                 ProviderOperation::LifecycleCallback => {
                     crate::composition_callback::composition_callback(&item.request)
                 }
+                ProviderOperation::ResourceFinalizePlan => Err("unsupported_operation"),
             };
             Some(match result {
                 Ok(response) => serde_json::to_value(response)

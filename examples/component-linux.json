@@ -14,10 +14,7 @@
       "nonary.display-settings/2"
     ],
     "call": [
-      "amaterasu.state/1",
-      "amaterasu.session-lifecycle/1",
-      "amaterasu.display/1",
-      "amaterasu.virtual-display/1"
+      "amaterasu.session-lifecycle/1"
     ]
   }
 }
