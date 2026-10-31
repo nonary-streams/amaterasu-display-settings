@@ -10,7 +10,8 @@ use serde_json::{Value, json};
 const SERVICE: &str = "amaterasu.state/1";
 const COLLECTION: &str = "display-settings/operation-receipts-v2";
 const WINDOW: u64 = 64;
-const MAX_CONTENT_BYTES: usize = 4096;
+pub(crate) const MAX_REQUEST_BYTES: usize = 7000;
+const MAX_RESULT_BYTES: usize = 4096;
 const MAX_FAILURES: u8 = 3;
 
 /// Authentication must check the exact selected lifecycle broker identity and
@@ -175,7 +176,7 @@ impl Operation {
                 if !valid_operation_id(operation_id) {
                     return Err("invalid_operation_id");
                 }
-                validate_content(request)
+                validate_content(request, MAX_REQUEST_BYTES)
             }
             Self::Complete {
                 request,
@@ -186,8 +187,8 @@ impl Operation {
                 if !valid_operation_id(operation_id) {
                     return Err("invalid_operation_id");
                 }
-                validate_content(request)?;
-                validate_content(result)
+                validate_content(request, MAX_REQUEST_BYTES)?;
+                validate_content(result, MAX_RESULT_BYTES)
             }
             _ => Ok(()),
         }
@@ -501,8 +502,8 @@ impl PendingStoreOperation {
                 return self.done(Outcome::Unknown);
             };
             if !valid_operation_id(&receipt.operation_id)
-                || validate_content(&receipt.request).is_err()
-                || matches!(&receipt.state, ReceiptState::Completed { result } if validate_content(result).is_err())
+                || validate_content(&receipt.request, MAX_REQUEST_BYTES).is_err()
+                || matches!(&receipt.state, ReceiptState::Completed { result } if validate_content(result, MAX_RESULT_BYTES).is_err())
             {
                 return self.done(Outcome::Unknown);
             }
@@ -658,8 +659,8 @@ impl PendingStoreOperation {
             return self.done(Outcome::Unknown);
         };
         if !valid_operation_id(&oldest.operation_id)
-            || validate_content(&oldest.request).is_err()
-            || !matches!(&oldest.state, ReceiptState::Completed { result } if validate_content(result).is_ok())
+            || validate_content(&oldest.request, MAX_REQUEST_BYTES).is_err()
+            || !matches!(&oldest.state, ReceiptState::Completed { result } if validate_content(result, MAX_RESULT_BYTES).is_ok())
         {
             return self.done(Outcome::Unknown);
         }
@@ -707,8 +708,8 @@ fn valid_id(value: &str, max: usize) -> bool {
 fn valid_operation_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && value.bytes().all(|b| b.is_ascii_graphic())
 }
-fn validate_content(value: &Value) -> Result<(), &'static str> {
-    if serde_json::to_vec(value).is_ok_and(|v| v.len() <= MAX_CONTENT_BYTES) {
+fn validate_content(value: &Value, limit: usize) -> Result<(), &'static str> {
+    if serde_json::to_vec(value).is_ok_and(|v| v.len() <= limit) {
         Ok(())
     } else {
         Err("content_too_large")
@@ -720,6 +721,27 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    #[test]
+    fn expanded_request_and_bounded_result_fit_state_collection_entry() {
+        let request = json!({"request":"x".repeat(MAX_REQUEST_BYTES - 20)});
+        let result = json!({"result":"y".repeat(MAX_RESULT_BYTES - 20)});
+        assert!(validate_content(&request, MAX_REQUEST_BYTES).is_ok());
+        assert!(validate_content(&result, MAX_RESULT_BYTES).is_ok());
+        let receipt = Receipt {
+            operation_id: "x".repeat(128),
+            request,
+            state: ReceiptState::Completed { result },
+        };
+        let entry = json!({"key":"9".repeat(20),"value":receipt});
+        assert!(serde_json::to_vec(&entry).unwrap().len() <= 12_000);
+        assert!(
+            validate_content(
+                &json!({"request":"x".repeat(MAX_REQUEST_BYTES)}),
+                MAX_REQUEST_BYTES
+            )
+            .is_err()
+        );
+    }
     fn epoch(name: &str) -> VerifiedEpoch {
         VerifiedEpoch::authenticate(name.into(), |_| true).unwrap()
     }

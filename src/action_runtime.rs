@@ -103,12 +103,14 @@ impl ObservationWriter {
                     if value["ok"] != true || value["found"] != true {
                         return ObservationWriteProgress::Unknown;
                     }
-                    let Ok(current) = serde_json::from_value::<
-                        crate::virtual_callback::VirtualObligation,
-                    >(value["value"].clone()) else {
+                    let raw = value["value"].clone();
+                    let format = raw.get("format_version").is_some();
+                    let Ok(mut envelope) = crate::resize_store::decode_envelope(raw) else {
                         return ObservationWriteProgress::Unknown;
                     };
-                    if current != self.journals[self.index].before {
+                    if envelope.active.is_some()
+                        || envelope.obligation != self.journals[self.index].before
+                    {
                         return ObservationWriteProgress::Unknown;
                     }
                     let Some(revision) = value["revision"].as_u64() else {
@@ -117,7 +119,12 @@ impl ObservationWriter {
                     let Some(next) = revision.checked_add(1) else {
                         return ObservationWriteProgress::Unknown;
                     };
-                    let payload = json!(self.journals[self.index].observed);
+                    envelope.obligation = self.journals[self.index].observed.clone();
+                    let payload = if format {
+                        json!(envelope)
+                    } else {
+                        json!(envelope.obligation)
+                    };
                     self.expected = Some(next);
                     let Ok(key) = self.key() else {
                         return ObservationWriteProgress::Unknown;
@@ -194,14 +201,14 @@ mod tests {
         JournalObservation{target:serde_json::from_value(json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1})).unwrap(),before,observed}
     }
     #[test]
-    fn observation_cas_rejects_stale_prior() {
+    fn observation_cas_preserves_envelope_and_rejects_stale_prior() {
         for stale in [false, true] {
             let observation = journal();
             let mut writer =
                 ObservationWriter::new(vec![observation.clone()], 77, 0, 1000).unwrap();
-            let mut value = json!(observation.before);
+            let mut value = json!({"format_version":1,"obligation":observation.before,"active":null,"lineage":[]});
             if stale {
-                value["geometry_revision"] = json!(9)
+                value["obligation"]["geometry_revision"] = json!(9)
             }
             let mut pending = Value::Null;
             let mut writes = 0;
@@ -237,7 +244,11 @@ mod tests {
             assert_eq!(completed, !stale);
             assert_eq!(writes, usize::from(!stale));
             if !stale {
-                assert_eq!(value["borrow"]["mutation_domain"]["revision"], 3);
+                assert_eq!(value["format_version"], 1);
+                assert_eq!(
+                    value["obligation"]["borrow"]["mutation_domain"]["revision"],
+                    3
+                );
             }
         }
     }

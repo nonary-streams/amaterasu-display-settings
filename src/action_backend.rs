@@ -57,6 +57,8 @@ pub struct VirtualActionBackend {
     exchange: Option<Exchange>,
     call: Option<PendingCall>,
     saved: Option<VirtualObligation>,
+    saved_envelope: Option<crate::resize_store::ResizeEnvelope>,
+    envelope_format: bool,
     next: Option<VirtualObligation>,
     expected_revision: Option<u64>,
     counter: u64,
@@ -140,6 +142,8 @@ impl VirtualActionBackend {
             exchange: Some(exchange),
             call: None,
             saved: None,
+            saved_envelope: None,
+            envelope_format: false,
             next: None,
             expected_revision: None,
             counter: 0,
@@ -229,10 +233,16 @@ impl VirtualActionBackend {
             self.unknown();
             return;
         };
-        let Ok(obligation) = serde_json::from_value::<VirtualObligation>(value.clone()) else {
+        let Ok(envelope) = crate::resize_store::decode_envelope(value.clone()) else {
             self.unknown();
             return;
         };
+        if envelope.active.is_some() {
+            self.unknown();
+            return;
+        }
+        self.envelope_format = value.get("format_version").is_some();
+        let obligation = envelope.obligation.clone();
         if payload.get("ok").and_then(Value::as_bool) != Some(true)
             || payload.get("found").and_then(Value::as_bool) != Some(true)
             || !matches_owned_plan(&self.request, &obligation)
@@ -246,6 +256,7 @@ impl VirtualActionBackend {
             Effect::Remove
         };
         self.saved = Some(obligation);
+        self.saved_envelope = Some(envelope);
         self.stage = Stage::CheckParent;
     }
     fn guarded(&mut self, payload: Value, now_ms: u64) {
@@ -434,11 +445,11 @@ impl VirtualActionBackend {
         let current = payload
             .get("value")
             .cloned()
-            .and_then(|v| serde_json::from_value::<VirtualObligation>(v).ok());
+            .and_then(|v| crate::resize_store::decode_envelope(v).ok());
         let revision = payload.get("revision").and_then(Value::as_u64);
         if payload.get("ok").and_then(Value::as_bool) != Some(true)
             || payload.get("found").and_then(Value::as_bool) != Some(true)
-            || current.as_ref() != self.saved.as_ref()
+            || current.as_ref() != self.saved_envelope.as_ref()
         {
             self.unknown();
             return;
@@ -452,10 +463,24 @@ impl VirtualActionBackend {
             return;
         };
         self.expected_revision = Some(next_revision);
+        let Some(mut envelope) = current else {
+            self.unknown();
+            return;
+        };
+        let Some(next) = self.next.clone() else {
+            self.unknown();
+            return;
+        };
+        envelope.obligation = next;
+        let value = if self.envelope_format {
+            json!(envelope)
+        } else {
+            json!(envelope.obligation)
+        };
         self.counter += 1;
         self.exchange = Some(make_exchange(
             STATE,
-            json!({"action":"set","key":self.key,"value":self.next,"expected_revision":revision}),
+            json!({"action":"set","key":self.key,"value":value,"expected_revision":revision}),
             format!("action.{}.save-write.{}", self.short_id(), self.counter),
             self.parent,
             self.remaining(now_ms),
@@ -470,6 +495,9 @@ impl VirtualActionBackend {
             return;
         }
         self.saved = self.next.clone();
+        if let (Some(envelope), Some(next)) = (&mut self.saved_envelope, &self.next) {
+            envelope.obligation = next.clone();
+        }
         self.stage = self.resume_after_save;
     }
     fn short_id(&self) -> String {
@@ -646,6 +674,7 @@ mod tests {
     }
     struct Broker {
         obligation: VirtualObligation,
+        envelope: Option<Value>,
         revision: u64,
         replies: BTreeMap<u64, Value>,
         next: u64,
@@ -659,6 +688,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 obligation: obligation(),
+                envelope: None,
                 revision: 0,
                 replies: BTreeMap::new(),
                 next: 0,
@@ -684,13 +714,17 @@ mod tests {
                     let result = if service == STATE {
                         match action {
                             "get" => {
-                                json!({"ok":true,"found":true,"revision":self.revision,"value":self.obligation})
+                                json!({"ok":true,"found":true,"revision":self.revision,"value":self.envelope.clone().unwrap_or_else(|| json!(self.obligation))})
                             }
                             "set"
                                 if payload["expected_revision"].as_u64() == Some(self.revision) =>
                             {
-                                self.obligation =
-                                    serde_json::from_value(payload["value"].clone()).unwrap();
+                                let value = payload["value"].clone();
+                                let decoded =
+                                    crate::resize_store::decode_envelope(value.clone()).unwrap();
+                                self.obligation = decoded.obligation;
+                                self.envelope =
+                                    value.get("format_version").is_some().then_some(value);
                                 self.revision += 1;
                                 json!({"ok":true,"revision":self.revision})
                             }
@@ -796,6 +830,63 @@ mod tests {
                 format!("{}:release_borrow", virtual_display::SERVICE),
                 format!("{}:remove", virtual_display::SERVICE)
             ]
+        );
+    }
+    #[test]
+    fn guarded_remove_preserves_resize_envelope_and_fences_invalid_active_state() {
+        let req = request();
+        let mut broker = Broker::new();
+        broker.envelope = Some(
+            json!({"format_version":1,"obligation":broker.obligation,"active":null,"lineage":[]}),
+        );
+        let mut backend = VirtualActionBackend::new(
+            action_provider::ACTION_CALLER,
+            req.clone(),
+            "session".into(),
+            99,
+            5000,
+            0,
+            |_, _| true,
+        )
+        .unwrap();
+        for tick in 1..300 {
+            backend.advance(tick, &mut |c| broker.send(c));
+            if backend.poll(&req) != EffectProgress::Waiting {
+                break;
+            }
+        }
+        assert!(matches!(backend.poll(&req), EffectProgress::Succeeded(_)));
+        assert_eq!(broker.envelope.as_ref().unwrap()["format_version"], 1);
+        assert_eq!(
+            broker.envelope.as_ref().unwrap()["obligation"]["reference_released"],
+            true
+        );
+        let mut blocked = Broker::new();
+        blocked.envelope = Some(
+            json!({"format_version":1,"obligation":blocked.obligation,"active":{},"lineage":[]}),
+        );
+        let mut backend = VirtualActionBackend::new(
+            action_provider::ACTION_CALLER,
+            req.clone(),
+            "session".into(),
+            99,
+            5000,
+            0,
+            |_, _| true,
+        )
+        .unwrap();
+        for tick in 1..50 {
+            backend.advance(tick, &mut |c| blocked.send(c));
+            if backend.poll(&req) != EffectProgress::Waiting {
+                break;
+            }
+        }
+        assert_eq!(backend.poll(&req), EffectProgress::Unknown);
+        assert!(
+            !blocked
+                .events
+                .iter()
+                .any(|event| event.starts_with(virtual_display::SERVICE))
         );
     }
     #[test]

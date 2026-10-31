@@ -235,6 +235,16 @@ impl PendingVerification {
                                     }))
                                 .then_some(plans)
                             });
+                            if self.plans.is_none() {
+                                self.plans = self.admitted_plans.as_ref().map(|entries| {
+                                    entries.iter().map(|entry| entry.plan.clone()).collect()
+                                });
+                            }
+                            if self.plans.is_none() {
+                                self.plans = self.admitted_plans.as_ref().map(|entries| {
+                                    entries.iter().map(|entry| entry.plan.clone()).collect()
+                                });
+                            }
                             self.obligations = reply.get("obligations").and_then(|value| {
                                 let obligations: Vec<ResourceObligation> =
                                     serde_json::from_value(value.clone()).ok()?;

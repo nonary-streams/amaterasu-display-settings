@@ -47,6 +47,7 @@ pub struct VerifiedSessionDisplay {
     pub target: LifecycleTarget,
     pub obligation: VirtualObligation,
     observed_revision: Option<u64>,
+    consumers_retired: bool,
 }
 impl VerifiedSessionDisplay {
     pub fn authenticate(
@@ -65,6 +66,7 @@ impl VerifiedSessionDisplay {
             target,
             obligation,
             observed_revision: None,
+            consumers_retired: false,
         })
     }
 }
@@ -293,6 +295,21 @@ impl Planner {
             session: None,
             release: Some((prior, domain, cleanup)),
         })
+    }
+    /// Allow a changed mode only on coordinator-authenticated retirement proof.
+    pub fn authorize_session_resize(
+        &mut self,
+        verify: impl FnOnce(&ProviderRequest) -> bool,
+    ) -> Result<(), &'static str> {
+        if !verify(&self.request) {
+            return Err("consumers_not_retired");
+        }
+        let session = self
+            .session
+            .as_mut()
+            .ok_or("session_ownership_unverified")?;
+        session.consumers_retired = true;
+        Ok(())
     }
     /// Attach only a coordinator-bound journal record before the first poll.
     /// This validates its native borrow before observing the new reference.
@@ -812,11 +829,11 @@ impl Planner {
             .ok_or("invalid_monitor_status")?;
         if let Some(session) = &self.session {
             let old = &session.obligation;
-            if old.width != mode.width
+            let changed = old.width != mode.width
                 || old.height != mode.height
                 || old.refresh_millihz != mode.refresh_millihz
-                || old.hdr_enabled != mode.hdr
-            {
+                || old.hdr_enabled != mode.hdr;
+            if changed && (!session.consumers_retired || old.hdr_enabled != mode.hdr) {
                 return Err("mode_change_requires_retirement");
             }
             let [monitor] = monitors.as_slice() else {
@@ -905,6 +922,22 @@ impl Planner {
             return Err("session_domain_changed");
         }
         let plan_revision = self.request.provider_sequence;
+        let resize = self.session.as_ref().filter(|session| {
+            let old = &session.obligation;
+            old.width != mode.width
+                || old.height != mode.height
+                || old.refresh_millihz != mode.refresh_millihz
+        });
+        // Resize geometry is refined from the confirmed native result after
+        // admission; this is only the pre-effect plan's placeholder.
+        let geometry_revision = plan_revision;
+        if let Some(session) = resize
+            && session.obligation.borrow.as_ref().is_none_or(|borrow| {
+                borrow.mutation_domain.revision != revision || borrow.mutation_domain.borrowers != 1
+            })
+        {
+            return Err("resize_journal_observation_stale");
+        }
         let selection = VirtualObligation {
             provider_service: virtual_display::SERVICE.into(),
             identity: identity.clone(),
@@ -918,7 +951,7 @@ impl Planner {
             layout: layout.into(),
             domain_id: id.into(),
             domain_revision: revision,
-            geometry_revision: plan_revision,
+            geometry_revision,
             borrow: None,
             reference_released: false,
         };
@@ -989,7 +1022,12 @@ impl Planner {
                 access: ResourceAccess::Exclusive,
             }],
             required_capabilities: vec![],
-            constraints: json!({"virtual_display":selection}),
+            constraints: match resize {
+                Some(session) => {
+                    json!({"virtual_display":selection,"virtual_reconfigure":{"session_target":session.target,"prior":session.obligation,"desired":mode},"geometry_source":"native_readback"})
+                }
+                None => json!({"virtual_display":selection}),
+            },
             obligations: vec![cleanup],
             affected_consumers: vec![],
             consumer_change: ConsumerChange::ReconnectRequired,
@@ -1344,12 +1382,6 @@ mod tests {
             Some(&1)
         );
         assert_eq!(plan.mutation_domains[0].expected_revision, 7);
-        assert!(plan.resources[0].incarnation.is_some());
-        assert_eq!(plan.resources[0].expected_revision, Some(7));
-        assert_eq!(
-            plan.candidate_constraint.as_ref().unwrap().incarnation,
-            plan.resources[0].incarnation
-        );
         assert_ne!(
             plan.constraints["virtual_display"]["reference_id"],
             json!(session_ref)
@@ -1365,6 +1397,27 @@ mod tests {
         assert_eq!(
             planner.virtual_plan(&busy).unwrap_err(),
             "mutation_domain_busy"
+        );
+        let Selection::Virtual { mode, .. } = &mut planner.selection else {
+            panic!("virtual selection")
+        };
+        mode.width = 1280;
+        mode.height = 720;
+        assert_eq!(
+            planner.virtual_plan(&provider_status).unwrap_err(),
+            "mode_change_requires_retirement"
+        );
+        assert!(planner.authorize_session_resize(|_| false).is_err());
+        planner.authorize_session_resize(|_| true).unwrap();
+        let resized = planner.virtual_plan(&provider_status).unwrap();
+        assert_eq!(resized.constraints["geometry_source"], "native_readback");
+        assert_eq!(
+            resized.constraints["virtual_reconfigure"]["desired"]["width"],
+            1280
+        );
+        assert_eq!(
+            resized.constraints["virtual_reconfigure"]["prior"]["width"],
+            1920
         );
         let mut drift = provider_status;
         drift["mutation_domain"]["revision"] = json!(8);

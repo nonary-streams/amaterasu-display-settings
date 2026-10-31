@@ -83,6 +83,23 @@ impl CreateDisplay {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DisplayRequest {
+    ReconfigureStatus {
+        reference: DisplayReference,
+        operation_id: String,
+        borrow_id: String,
+        domain_id: String,
+        revision: u64,
+    },
+    Reconfigure {
+        reference: DisplayReference,
+        operation_id: String,
+        borrow_id: String,
+        width: u32,
+        height: u32,
+        refresh_millihz: u32,
+        domain_id: String,
+        revision: u64,
+    },
     Create(CreateDisplay),
     CreatePlanned {
         create: CreateDisplay,
@@ -110,6 +127,8 @@ impl DisplayRequest {
             Self::Status(reference)
             | Self::Remove(reference)
             | Self::Borrow(reference)
+            | Self::Reconfigure { reference, .. }
+            | Self::ReconfigureStatus { reference, .. }
             | Self::ValidateBorrow { reference, .. }
             | Self::ReleaseBorrow { reference, .. } => reference,
         }
@@ -119,6 +138,46 @@ impl DisplayRequest {
         self.reference().validate()?;
         let reference = self.reference();
         Ok(match self {
+            Self::ReconfigureStatus {
+                operation_id,
+                borrow_id,
+                domain_id,
+                revision,
+                ..
+            } => {
+                if operation_id.is_empty()
+                    || operation_id.len() > 128
+                    || !operation_id.bytes().all(|b| b.is_ascii_graphic())
+                    || !valid_borrow_id(borrow_id)
+                    || !valid_domain_id(domain_id)
+                {
+                    return Err("invalid reconfiguration status");
+                }
+                json!({"action":"reconfigure_status","operation_id":operation_id,"identity":reference.identity,"reference_id":reference.reference_id,"borrow_id":borrow_id,"expected_topology_domain_id":domain_id,"expected_topology_revision":revision})
+            }
+            Self::Reconfigure {
+                operation_id,
+                borrow_id,
+                width,
+                height,
+                refresh_millihz,
+                domain_id,
+                revision,
+                ..
+            } => {
+                if operation_id.is_empty()
+                    || operation_id.len() > 128
+                    || !operation_id.bytes().all(|b| b.is_ascii_graphic())
+                    || !valid_borrow_id(borrow_id)
+                    || !valid_domain_id(domain_id)
+                    || !(320..=7680).contains(width)
+                    || !(200..=4320).contains(height)
+                    || !(1000..=1_000_000).contains(refresh_millihz)
+                {
+                    return Err("invalid reconfiguration");
+                }
+                json!({"action":"reconfigure","operation_id":operation_id,"identity":reference.identity,"reference_id":reference.reference_id,"borrow_id":borrow_id,"width":width,"height":height,"refresh_millihz":refresh_millihz,"expected_topology_domain_id":domain_id,"expected_topology_revision":revision})
+            }
             Self::Create(create) | Self::CreatePlanned { create, .. } => {
                 create.validate()?;
                 let mut value = json!({"action":"create", "identity":reference.identity,
@@ -234,6 +293,7 @@ pub enum DisplayOutcome {
     /// The provider did not establish successful completion.
     ProviderError(String),
     Borrowed(DisplayBorrow),
+    ReconfigurePending,
     BorrowReleased(MutationDomain),
 }
 
@@ -487,7 +547,22 @@ fn parse_response(request: &DisplayRequest, payload: &Value) -> Option<DisplayOu
                 _ => None,
             }
         }
-        DisplayRequest::Borrow(_) | DisplayRequest::ValidateBorrow { .. } => {
+        DisplayRequest::Borrow(_)
+        | DisplayRequest::ValidateBorrow { .. }
+        | DisplayRequest::Reconfigure { .. }
+        | DisplayRequest::ReconfigureStatus { .. } => {
+            if let DisplayRequest::Reconfigure { operation_id, .. }
+            | DisplayRequest::ReconfigureStatus { operation_id, .. } = request
+            {
+                if payload.get("operation_id")?.as_str()? != operation_id {
+                    return None;
+                }
+                match payload.get("state")?.as_str()? {
+                    "pending" => return Some(DisplayOutcome::ReconfigurePending),
+                    "succeeded" => {}
+                    _ => return None,
+                }
+            }
             let borrow_id = payload.get("borrow_id")?.as_str()?.to_owned();
             if !valid_borrow_id(&borrow_id) {
                 return None;
@@ -877,5 +952,76 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn reconfiguration_requires_exact_operation_echo_and_known_state() {
+        let request = DisplayRequest::Reconfigure {
+            reference: reference(),
+            operation_id: "resize.abc".into(),
+            borrow_id: "a".repeat(64),
+            width: 1280,
+            height: 720,
+            refresh_millihz: 60000,
+            domain_id: "provider_session:abc".into(),
+            revision: 3,
+        };
+        let pending = json!({"ok":true,"state":"pending","operation_id":"resize.abc"});
+        assert_eq!(
+            parse_response(&request, &pending),
+            Some(DisplayOutcome::ReconfigurePending)
+        );
+        let mut changed = pending.clone();
+        changed["operation_id"] = json!("resize.other");
+        assert!(parse_response(&request, &changed).is_none());
+        changed = pending;
+        changed["state"] = json!("unknown");
+        assert!(parse_response(&request, &changed).is_none());
+        let mut call = PendingCall::new(request, "transport.1".into(), Some(77), 5000, 0).unwrap();
+        assert_eq!(
+            call.poll(1, &mut |command| match command {
+                Command::Request {
+                    payload, parent, ..
+                } => {
+                    assert_eq!(parent, Some(77));
+                    assert_eq!(payload["expected_topology_revision"], 3);
+                    assert_eq!(payload["operation_id"], "resize.abc");
+                    Ok(Response::Accepted { id: 1 })
+                }
+                _ => panic!("unexpected command"),
+            }),
+            CallProgress::Waiting
+        );
+    }
+    #[test]
+    fn recovery_status_is_lookup_only_and_rejects_wrong_operation() {
+        let request = DisplayRequest::ReconfigureStatus {
+            reference: reference(),
+            operation_id: "resize.abc".into(),
+            borrow_id: "a".repeat(64),
+            domain_id: "provider_session:abc".into(),
+            revision: 3,
+        };
+        let payload = request.payload().unwrap();
+        assert_eq!(payload["action"], "reconfigure_status");
+        assert_eq!(payload["operation_id"], "resize.abc");
+        assert!(payload.get("width").is_none());
+        assert_eq!(
+            parse_response(
+                &request,
+                &json!({"ok":true,"state":"pending","operation_id":"resize.abc"})
+            ),
+            Some(DisplayOutcome::ReconfigurePending)
+        );
+        assert!(
+            parse_response(
+                &request,
+                &json!({"ok":true,"state":"pending","operation_id":"resize.other"})
+            )
+            .is_none()
+        );
+        assert!(matches!(
+            parse_response(&request, &json!({"ok":false,"code":"recovery_required"})),
+            Some(DisplayOutcome::ProviderError(_))
+        ));
     }
 }

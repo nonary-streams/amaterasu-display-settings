@@ -77,6 +77,53 @@ impl VirtualObligation {
     }
 }
 
+/// Prove a completed resize chain descends from the exact admitted target
+/// obligation; pending transitions never authorize ordinary readers.
+pub(crate) fn lineage_authorizes(
+    envelope: &crate::resize_store::ResizeEnvelope,
+    target: &LifecycleTarget,
+    planned: &VirtualObligation,
+) -> bool {
+    if envelope.active.is_some() || envelope.obligation.reference_released {
+        return false;
+    }
+    let mut initial = envelope
+        .checkpoint
+        .as_ref()
+        .or_else(|| envelope.lineage.first())
+        .map(|r| r.prior.clone())
+        .unwrap_or_else(|| envelope.obligation.clone());
+    initial.borrow = None;
+    if &initial != planned
+        || envelope
+            .checkpoint
+            .as_ref()
+            .is_some_and(|r| &r.session_target != target)
+        || envelope.lineage.iter().any(|r| &r.session_target != target)
+    {
+        return false;
+    }
+    let Some(last) = envelope.lineage.last() else {
+        return true;
+    };
+    let mut expected = last.updated.clone();
+    let Some(old_borrow) = expected.borrow.take() else {
+        return false;
+    };
+    let mut current = envelope.obligation.clone();
+    let Some(current_borrow) = current.borrow.take() else {
+        return false;
+    };
+    expected == current
+        && old_borrow.borrow_id == current_borrow.borrow_id
+        && old_borrow.observed_output == current_borrow.observed_output
+        && old_borrow.mutation_domain.id == current_borrow.mutation_domain.id
+        && old_borrow.mutation_domain.scope == current_borrow.mutation_domain.scope
+        && current_borrow.mutation_domain.revision >= old_borrow.mutation_domain.revision
+        && current_borrow.mutation_domain.pending_mutations == 0
+        && current_borrow.mutation_domain.borrowers > 0
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum StoreCommand {
     Reserve {
@@ -176,6 +223,19 @@ enum Phase {
     Done,
 }
 
+/// Preflight durable receipt capacity before any admitted native mutation.
+pub fn receipt_request_fingerprint(request: &ProviderRequest) -> Result<Value, &'static str> {
+    let fingerprint = serde_json::to_value(request).map_err(|_| "invalid_request")?;
+    if serde_json::to_vec(&fingerprint)
+        .map_err(|_| "invalid_request")?
+        .len()
+        > crate::receipt_store::MAX_REQUEST_BYTES
+    {
+        return Err("receipt_request_too_large");
+    }
+    Ok(fingerprint)
+}
+
 pub struct VirtualCallback {
     sequence: u64,
     operation_id: String,
@@ -191,6 +251,7 @@ pub struct VirtualCallback {
     prepare: bool,
     ready_output: Option<String>,
     callback_parent: Option<u64>,
+    post_resize_revision: Option<u64>,
 }
 impl VirtualCallback {
     /// The verifier must authenticate the selected coordinator and its durable
@@ -299,14 +360,7 @@ impl VirtualCallback {
             }
             requested = old;
         }
-        let fingerprint = serde_json::to_value(&request).map_err(|_| "invalid_request")?;
-        if serde_json::to_vec(&fingerprint)
-            .map_err(|_| "invalid_request")?
-            .len()
-            > 4096
-        {
-            return Err("receipt_request_too_large");
-        }
+        let fingerprint = receipt_request_fingerprint(&request)?;
         let deadline_ms = now_ms.saturating_add(request.remaining_ms.min(30_000));
         Ok(Self {
             sequence: request.provider_sequence,
@@ -323,7 +377,78 @@ impl VirtualCallback {
             prepare,
             ready_output: None,
             callback_parent,
+            post_resize_revision: None,
         })
+    }
+    /// Bind a durably committed and freshly validated resize result to this
+    /// admitted stream transition before any stream reference is created.
+    pub fn attach_resize_result(
+        &mut self,
+        intent: &crate::session_resize::ResizeIntent,
+        updated: &VirtualObligation,
+        verify: impl FnOnce(&crate::session_resize::ResizeIntent, &VirtualObligation) -> bool,
+    ) -> Result<(), &'static str> {
+        if self.phase != Phase::Reserve
+            || !self.prepare
+            || self.post_resize_revision.is_some()
+            || intent.request != self.request
+            || !verify(intent, updated)
+            || !crate::resize_store::valid_update(intent, updated)
+        {
+            return Err("resize_result_unverified");
+        }
+        let plan = self.request.approved_plan.as_ref().ok_or("missing_plan")?;
+        if plan
+            .constraints
+            .get("geometry_source")
+            .and_then(Value::as_str)
+            != Some("native_readback")
+            || plan.constraints.get("virtual_reconfigure")
+                != Some(
+                    &json!({"session_target":intent.session_target,"prior":intent.prior,"desired":intent.desired}),
+                )
+            || updated.identity != self.obligation.identity
+            || updated.domain_id != self.obligation.domain_id
+            || updated.width != self.obligation.width
+            || updated.height != self.obligation.height
+            || updated.refresh_millihz != self.obligation.refresh_millihz
+            || updated.hdr_enabled != self.obligation.hdr_enabled
+        {
+            return Err("resize_result_mismatch");
+        }
+        let old_borrow = intent
+            .prior
+            .borrow
+            .as_ref()
+            .ok_or("resize_result_unverified")?;
+        let new_borrow = updated.borrow.as_ref().ok_or("resize_result_unverified")?;
+        if producer_incarnation(
+            &updated.domain_id,
+            &updated.identity,
+            &new_borrow.observed_output,
+        ) != producer_incarnation(
+            &intent.prior.domain_id,
+            &intent.prior.identity,
+            &old_borrow.observed_output,
+        ) {
+            return Err("resize_producer_changed");
+        }
+        let revision = new_borrow.mutation_domain.revision;
+        if updated.geometry_revision != revision {
+            return Err("resize_geometry_unverified");
+        }
+        self.obligation.geometry_revision = revision;
+        self.post_resize_revision = Some(revision);
+        Ok(())
+    }
+    /// The live dispatcher calls this only after the exact request's durable
+    /// receipt has just been reserved, before any resize effect.
+    pub(crate) fn accept_reserved_resize_receipt(&mut self) -> Result<(), &'static str> {
+        if self.phase != Phase::Reserve || self.post_resize_revision.is_none() {
+            return Err("resize_receipt_unverified");
+        }
+        self.phase = Phase::SaveInitial;
+        Ok(())
     }
     /// One store or broker operation per tick; timeout preserves obligations.
     pub fn poll(
@@ -333,6 +458,16 @@ impl VirtualCallback {
         store: &mut impl DurableVirtualStore,
         guard: &mut impl EffectGuard,
     ) -> CallbackProgress {
+        if self.prepare
+            && self
+                .request
+                .approved_plan
+                .as_ref()
+                .is_some_and(|p| p.constraints.get("virtual_reconfigure").is_some())
+            && self.post_resize_revision.is_none()
+        {
+            return self.unknown();
+        }
         if self.phase != Phase::Done && now_ms >= self.deadline_ms {
             return self.unknown();
         }
@@ -470,7 +605,9 @@ impl VirtualCallback {
                     create: self.obligation.create(),
                     layout: self.obligation.layout.clone(),
                     domain_id: self.obligation.domain_id.clone(),
-                    revision: self.obligation.domain_revision,
+                    revision: self
+                        .post_resize_revision
+                        .unwrap_or(self.obligation.domain_revision),
                 },
                 Phase::Status | Phase::CleanupStatus => {
                     if self.status_count >= MAX_STATUS {
@@ -998,6 +1135,97 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn resize_result_must_be_committed_and_match_admitted_producer() {
+        let base = request();
+        let machine =
+            VirtualCallback::new(COORDINATOR, base.clone(), None, |_| true, 0, Some(99)).unwrap();
+        let native = borrow();
+        let mut prior = machine.obligation.clone();
+        prior.reference_id = "session-ref".into();
+        prior.borrow = Some(DisplayBorrow {
+            borrow_id: native["borrow_id"].as_str().unwrap().into(),
+            observed_output: serde_json::from_value(native["observed_output"].clone()).unwrap(),
+            mutation_domain: serde_json::from_value(native["mutation_domain"].clone()).unwrap(),
+        });
+        let target: LifecycleTarget = serde_json::from_value(json!({"kind":"session","host_epoch":"epoch-1","session_id":"session-1","generation":1})).unwrap();
+        let desired: extension_api::VideoMode = serde_json::from_value(
+            json!({"width":1280,"height":720,"refresh_millihz":60000,"hdr":false}),
+        )
+        .unwrap();
+        let mut request = base;
+        let plan = request.approved_plan.as_mut().unwrap();
+        plan.constraints["virtual_display"]["width"] = json!(1280);
+        plan.constraints["virtual_display"]["height"] = json!(720);
+        plan.constraints["virtual_reconfigure"] =
+            json!({"session_target":target,"prior":prior,"desired":desired});
+        plan.constraints["geometry_source"] = json!("native_readback");
+        plan.candidate_constraint.as_mut().unwrap().mode = Some(desired.clone());
+        let intent = crate::session_resize::ResizeIntent {
+            request: request.clone(),
+            session_target: target,
+            prior: prior.clone(),
+            desired: desired.clone(),
+            operation_id: "resize.1".into(),
+        };
+        let mut updated = prior;
+        updated.width = desired.width;
+        updated.height = desired.height;
+        let saved = updated.borrow.as_mut().unwrap();
+        saved.borrow_id = "c".repeat(64);
+        saved.mutation_domain.revision += 1;
+        saved.observed_output.width = desired.width;
+        saved.observed_output.height = desired.height;
+        updated.geometry_revision = saved.mutation_domain.revision;
+        let mut callback =
+            VirtualCallback::new(COORDINATOR, request.clone(), None, |_| true, 0, Some(99))
+                .unwrap();
+        assert!(
+            callback
+                .attach_resize_result(&intent, &updated, |_, _| false)
+                .is_err()
+        );
+        let mut foreign = updated.clone();
+        foreign
+            .borrow
+            .as_mut()
+            .unwrap()
+            .observed_output
+            .registry_global += 1;
+        assert!(
+            callback
+                .attach_resize_result(&intent, &foreign, |_, _| true)
+                .is_err()
+        );
+        callback
+            .attach_resize_result(&intent, &updated, |_, _| true)
+            .unwrap();
+        assert_eq!(
+            callback.obligation.geometry_revision,
+            updated.geometry_revision
+        );
+        assert_eq!(
+            callback.post_resize_revision,
+            Some(updated.geometry_revision)
+        );
+        let mut no_result =
+            VirtualCallback::new(COORDINATOR, request, None, |_| true, 0, Some(99)).unwrap();
+        let mut store = FakeStore {
+            replies: VecDeque::new(),
+            commands: vec![],
+        };
+        let mut guard = AllowGuard;
+        assert!(matches!(
+            no_result.poll(
+                1,
+                &mut |_| panic!("no native effect"),
+                &mut store,
+                &mut guard
+            ),
+            CallbackProgress::RecoveryRequired
+        ));
+        assert!(store.commands.is_empty());
+    }
     #[test]
     fn producer_incarnation_is_shared_between_borrows_and_changes_with_output() {
         let payload = borrow();

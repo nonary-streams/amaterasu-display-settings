@@ -27,7 +27,9 @@ and separate cleanup obligations. Unknown effects require reconciliation. The
 current source supports cooperative Wayland-owned displays; Linux physical
 display mutation remains unavailable. The physical provider coordinates its own
 leases and reads native topology, but cannot fence unrelated desktop or OS
-changes. Physical and action coverage is tracked in the parity ledger.
+changes. An interrupted resize can be reconciled without replaying the native operation;
+if stream preparation was interrupted before publication, it remains fenced for
+future scoped cleanup. Physical and action coverage is tracked in the parity ledger.
 
 `examples/component-linux.json` is a component-manifest template; the packager
 replaces its hash and size. `examples/lifecycle-api-approvals.json` shows the

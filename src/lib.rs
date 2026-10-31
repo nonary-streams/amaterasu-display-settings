@@ -18,6 +18,12 @@ pub mod physical_display;
 pub mod physical_release_plan;
 pub mod receipt_store;
 pub mod resource_plan;
+pub mod session_resize;
 pub mod settings_schema;
 pub mod virtual_callback;
 pub mod virtual_display;
+
+pub mod resize_recovery;
+pub mod resize_store;
+
+mod resize_runtime;

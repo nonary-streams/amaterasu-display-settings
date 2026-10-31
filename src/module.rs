@@ -1,6 +1,7 @@
 //! Native extension API entry point. Lifecycle effects stay closed until the
 //! coordinator can prove the complete admitted request and retirement fence.
 use crate::coordinator::{PendingVerification, Verification};
+use crate::resize_runtime::{LiveRecoveryGuard, LiveResizeGuard};
 use amaterasu_module_sdk::{
     ApiFieldKind as Kind, ApiMethod, ApiPrivilege, ApiSchema, Command, ManagedModule, ModuleResult,
     Response, RuntimeClient,
@@ -81,8 +82,23 @@ enum PendingPhase {
         obligations: Vec<extension_api::ResourceObligation>,
         store: Box<crate::durable_store::VirtualDurableStateStore>,
     },
+    RefreshPrepare {
+        planner: Box<crate::resource_plan::Planner>,
+        refresh: Box<crate::observation_refresh::ObservationRefresh>,
+        consumers_retired: bool,
+        target: LifecycleTarget,
+        timeout: u64,
+    },
+    WritePrepareObservation {
+        planner: Box<crate::resource_plan::Planner>,
+        writer: Box<crate::action_runtime::ObservationWriter>,
+        consumers_retired: bool,
+        target: LifecycleTarget,
+        timeout: u64,
+    },
     PlanSessionLoad {
         planner: Box<crate::resource_plan::Planner>,
+        consumers_retired: bool,
         target: LifecycleTarget,
         store: Box<crate::durable_store::VirtualDurableStateStore>,
     },
@@ -94,6 +110,10 @@ enum PendingPhase {
         request: Box<ProviderRequest>,
         receipt: Box<crate::receipt_store::Receipt>,
         verification: Box<PendingVerification>,
+    },
+    StatusResizeRecovery {
+        machine: Box<crate::resize_recovery::ResizeRecovery>,
+        guard: Box<LiveRecoveryGuard>,
     },
     StatusBindingLoad {
         request: Box<ProviderRequest>,
@@ -118,6 +138,25 @@ enum PendingPhase {
     VirtualLoad {
         request: Box<ProviderRequest>,
         store: Box<crate::durable_store::VirtualDurableStateStore>,
+    },
+    ResizePreflight {
+        request: Box<ProviderRequest>,
+        machine: Box<crate::session_resize::SessionResize>,
+        store: Box<crate::resize_store::DurableResizeStore>,
+        stream_store: Box<crate::durable_store::VirtualDurableStateStore>,
+    },
+    ResizeReserve {
+        request: Box<ProviderRequest>,
+        machine: Box<crate::session_resize::SessionResize>,
+        store: Box<crate::resize_store::DurableResizeStore>,
+        stream_store: Box<crate::durable_store::VirtualDurableStateStore>,
+    },
+    Resize {
+        request: Box<ProviderRequest>,
+        machine: Box<crate::session_resize::SessionResize>,
+        store: Box<crate::resize_store::DurableResizeStore>,
+        stream_store: Box<crate::durable_store::VirtualDurableStateStore>,
+        guard: Box<LiveResizeGuard>,
     },
     Physical {
         machine: Box<crate::physical_callback::PhysicalCallback>,
@@ -590,11 +629,18 @@ impl crate::virtual_callback::EffectGuard for LiveEffectGuard {
                 GuardProgress::Unknown
             }
             Verification::Verified => {
+                let retirement_required = request
+                    .approved_plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.constraints.get("virtual_reconfigure").is_some());
+                let retired = verification.consumers_retired() == Some(true);
                 self.current = None;
-                if matches!(
-                    send(Command::CheckRequest { request: parent }),
-                    Ok(Response::Ok)
-                ) {
+                if (!retirement_required || retired)
+                    && matches!(
+                        send(Command::CheckRequest { request: parent }),
+                        Ok(Response::Ok)
+                    )
+                {
                     GuardProgress::Authorized
                 } else {
                     GuardProgress::Unknown
@@ -716,16 +762,25 @@ fn prior_physical_cleanup(
     Ok((plan.clone(), plan.obligations.clone()))
 }
 fn prior_virtual_cleanup(
-    prior: &crate::virtual_callback::VirtualObligation,
+    envelope: &crate::resize_store::ResizeEnvelope,
+    target: &LifecycleTarget,
     plans: &[extension_api::ResourcePlan],
     obligations: &[extension_api::ResourceObligation],
 ) -> Result<extension_api::ResourceObligation, &'static str> {
-    let mut expected = prior.clone();
-    expected.borrow = None;
+    let prior = &envelope.obligation;
     let mut found = plans.iter().filter_map(|plan| {
-        let constraint: crate::virtual_callback::VirtualObligation =
+        let mut constraint: crate::virtual_callback::VirtualObligation =
             serde_json::from_value(plan.constraints.get("virtual_display")?.clone()).ok()?;
-        if constraint != expected {
+        if plan
+            .constraints
+            .get("geometry_source")
+            .and_then(Value::as_str)
+            == Some("native_readback")
+            && plan.constraints.get("virtual_reconfigure").is_some()
+        {
+            constraint.geometry_revision = prior.geometry_revision;
+        }
+        if !crate::virtual_callback::lineage_authorizes(envelope, target, &constraint) {
             return None;
         }
         let mut matches = plan.obligations.iter().filter(|obligation| {
@@ -970,7 +1025,7 @@ fn advance_phase(
             mut store,
         } => {
             store.advance(now_ms, send);
-            match store.poll_load() {
+            match store.poll_load_envelope() {
                 LoadProgress::Waiting => Ok(PendingPhase::PlanReleaseLoad {
                     request,
                     expected,
@@ -979,12 +1034,14 @@ fn advance_phase(
                     obligations,
                     store,
                 }),
-                LoadProgress::Found(prior) => {
+                LoadProgress::Found(envelope) => {
+                    let prior = envelope.obligation.clone();
                     if prior != *expected {
                         return Err(recovery("release_journal_changed"));
                     }
                     let cleanup =
-                        prior_virtual_cleanup(&prior, &plans, &obligations).map_err(recovery)?;
+                        prior_virtual_cleanup(&envelope, &request.target, &plans, &obligations)
+                            .map_err(recovery)?;
                     let mut matching = domains
                         .into_iter()
                         .filter(|domain| domain.domain == prior.domain_id);
@@ -1012,8 +1069,92 @@ fn advance_phase(
                 LoadProgress::Unknown => Err(recovery("release_ownership_unknown")),
             }
         }
+        PendingPhase::RefreshPrepare {
+            planner,
+            mut refresh,
+            consumers_retired,
+            target,
+            timeout,
+        } => match refresh.poll(now_ms, send) {
+            crate::observation_refresh::RefreshProgress::Waiting => {
+                Ok(PendingPhase::RefreshPrepare {
+                    planner,
+                    refresh,
+                    consumers_retired,
+                    target,
+                    timeout,
+                })
+            }
+            crate::observation_refresh::RefreshProgress::Unknown => {
+                Err(recovery("prepare_observation_unknown"))
+            }
+            crate::observation_refresh::RefreshProgress::Complete { journals, .. } => {
+                if !journals.iter().any(|j| j.target == target) {
+                    return Err(recovery("session_ownership_unavailable"));
+                }
+                let writer = crate::action_runtime::ObservationWriter::new(
+                    journals, request_id, now_ms, timeout,
+                )
+                .map_err(rejected)?;
+                Ok(PendingPhase::WritePrepareObservation {
+                    planner,
+                    writer: Box::new(writer),
+                    consumers_retired,
+                    target,
+                    timeout,
+                })
+            }
+        },
+        PendingPhase::WritePrepareObservation {
+            planner,
+            mut writer,
+            consumers_retired,
+            target,
+            timeout,
+        } => match writer.poll(now_ms, send) {
+            crate::action_runtime::ObservationWriteProgress::Waiting => {
+                Ok(PendingPhase::WritePrepareObservation {
+                    planner,
+                    writer,
+                    consumers_retired,
+                    target,
+                    timeout,
+                })
+            }
+            crate::action_runtime::ObservationWriteProgress::Unknown => {
+                Err(recovery("session_observation_persist_unknown"))
+            }
+            crate::action_runtime::ObservationWriteProgress::Complete => {
+                let epoch = crate::receipt_store::VerifiedEpoch::authenticate(
+                    target_epoch(&target).to_owned(),
+                    |_| true,
+                )
+                .map_err(rejected)?;
+                let key = crate::durable_store::VerifiedTarget::authenticate(
+                    target_store_key(&target).map_err(rejected)?,
+                    |_| true,
+                )
+                .map_err(rejected)?;
+                let mut store = crate::durable_store::VirtualDurableStateStore::new(
+                    epoch,
+                    key,
+                    format!("plansession.{request_id}"),
+                    Some(request_id),
+                    timeout,
+                )
+                .map_err(rejected)?;
+                store.start_load().map_err(rejected)?;
+                Ok(PendingPhase::PlanSessionLoad {
+                    planner,
+                    consumers_retired,
+                    target,
+                    store: Box::new(store),
+                })
+            }
+        },
         PendingPhase::PlanSessionLoad {
             mut planner,
+            consumers_retired,
             target,
             mut store,
         } => {
@@ -1021,6 +1162,7 @@ fn advance_phase(
             match store.poll_load() {
                 LoadProgress::Waiting => Ok(PendingPhase::PlanSessionLoad {
                     planner,
+                    consumers_retired,
                     target,
                     store,
                 }),
@@ -1032,6 +1174,11 @@ fn advance_phase(
                     )
                     .map_err(rejected)?;
                     planner.attach_session(session, now_ms).map_err(rejected)?;
+                    if consumers_retired {
+                        planner
+                            .authorize_session_resize(|_| true)
+                            .map_err(rejected)?;
+                    }
                     Ok(PendingPhase::Plan { planner })
                 }
                 LoadProgress::Absent => Err(rejected("session_ownership_unverified")),
@@ -1081,6 +1228,34 @@ fn advance_phase(
                 verification,
             }),
             Verification::Verified => {
+                if matches!(receipt.state, crate::receipt_store::ReceiptState::Pending)
+                    && request
+                        .approved_plan
+                        .as_ref()
+                        .is_some_and(|p| p.constraints.get("virtual_reconfigure").is_some())
+                {
+                    if verification.consumers_retired() != Some(true) {
+                        return Err(recovery("resize_retirement_unverified"));
+                    }
+                    let target = verification
+                        .session_target()
+                        .cloned()
+                        .ok_or_else(|| recovery("session_target_unavailable"))?;
+                    let machine = crate::resize_recovery::ResizeRecovery::new(
+                        LIFECYCLE_CALLER,
+                        target,
+                        (*request).clone(),
+                        None,
+                        request.remaining_ms.min(30_000),
+                        now_ms,
+                        |_| true,
+                    )
+                    .map_err(rejected)?;
+                    return Ok(PendingPhase::StatusResizeRecovery {
+                        machine: Box::new(machine),
+                        guard: Box::new(LiveRecoveryGuard::new(*request)),
+                    });
+                }
                 if let crate::receipt_store::ReceiptState::Completed { result } = &receipt.state
                     && let Ok(crate::virtual_callback::CallbackResult::Prepared {
                         candidate,
@@ -1124,6 +1299,20 @@ fn advance_phase(
                 Err(receipt_response(&request, &receipt))
             }
             _ => Err(recovery("receipt_verification_unknown")),
+        },
+        PendingPhase::StatusResizeRecovery {
+            mut machine,
+            mut guard,
+        } => match machine.poll(now_ms, send, &mut *guard) {
+            crate::resize_recovery::RecoveryProgress::Waiting => {
+                Ok(PendingPhase::StatusResizeRecovery { machine, guard })
+            }
+            crate::resize_recovery::RecoveryProgress::Recovered(_) => {
+                Err(recovery("resize_reconciled_stream_incomplete"))
+            }
+            crate::resize_recovery::RecoveryProgress::RecoveryRequired => {
+                Err(recovery("resize_reconciliation_required"))
+            }
         },
         PendingPhase::StatusBindingLoad {
             request,
@@ -1231,10 +1420,14 @@ fn advance_phase(
                             })
                             .map(|p| p.plan.clone())
                             .collect();
+                        let observation_obligations = admitted
+                            .iter()
+                            .flat_map(|entry| entry.plan.obligations.iter().cloned())
+                            .collect();
                         let refresh = crate::observation_refresh::ObservationRefresh::new(
                             request.target.clone(),
                             admitted,
-                            obligations.clone(),
+                            observation_obligations,
                             Some(request_id),
                             request.remaining_ms.min(30_000),
                             now_ms,
@@ -1302,7 +1495,23 @@ fn advance_phase(
                             .unwrap_or("virtual")
                             == "virtual";
                     let session_target = verification.session_target().cloned();
+                    let consumers_retired = verification.consumers_retired() == Some(true);
                     let timeout = request.remaining_ms.min(30_000);
+                    let refresh_metadata = if needs_session {
+                        Some((
+                            request.target.clone(),
+                            verification
+                                .admitted_plans()
+                                .ok_or_else(|| recovery("prepare_plans_unavailable"))?
+                                .to_vec(),
+                            verification
+                                .obligations()
+                                .ok_or_else(|| recovery("prepare_obligations_unavailable"))?
+                                .to_vec(),
+                        ))
+                    } else {
+                        None
+                    };
                     let planner = crate::resource_plan::Planner::new(
                         LIFECYCLE_CALLER,
                         *request,
@@ -1314,33 +1523,101 @@ fn advance_phase(
                     if needs_session {
                         let target =
                             session_target.ok_or_else(|| recovery("session_target_unavailable"))?;
-                        let epoch = crate::receipt_store::VerifiedEpoch::authenticate(
-                            target_epoch(&target).to_owned(),
-                            |_| true,
-                        )
-                        .map_err(rejected)?;
-                        let key = crate::durable_store::VerifiedTarget::authenticate(
-                            target_store_key(&target).map_err(rejected)?,
-                            |_| true,
-                        )
-                        .map_err(rejected)?;
-                        let mut store = crate::durable_store::VirtualDurableStateStore::new(
-                            epoch,
-                            key,
-                            format!("plansession.{request_id}"),
+                        let (planning_target, plans, obligations) =
+                            refresh_metadata.expect("metadata");
+                        let observation_obligations = plans
+                            .iter()
+                            .flat_map(|entry| entry.plan.obligations.iter().cloned())
+                            .collect();
+                        let _ = obligations; // scoped live obligations are checked by release/cleanup.
+                        let refresh = crate::observation_refresh::ObservationRefresh::new(
+                            planning_target,
+                            plans,
+                            observation_obligations,
                             Some(request_id),
                             timeout,
+                            now_ms,
+                            |_, _, _| true,
                         )
                         .map_err(rejected)?;
-                        store.start_load().map_err(rejected)?;
-                        return Ok(PendingPhase::PlanSessionLoad {
+                        return Ok(PendingPhase::RefreshPrepare {
                             planner: Box::new(planner),
+                            refresh: Box::new(refresh),
+                            consumers_retired,
                             target,
-                            store: Box::new(store),
+                            timeout,
                         });
                     }
                     return Ok(PendingPhase::Plan {
                         planner: Box::new(planner),
+                    });
+                }
+                if preparing(&request)
+                    && request
+                        .approved_plan
+                        .as_ref()
+                        .is_some_and(|p| p.constraints.get("virtual_reconfigure").is_some())
+                {
+                    if verification.consumers_retired() != Some(true) {
+                        return Err(rejected("consumers_not_retired"));
+                    }
+                    crate::virtual_callback::receipt_request_fingerprint(&request)
+                        .map_err(rejected)?;
+                    let spec = &request.approved_plan.as_ref().expect("plan").constraints["virtual_reconfigure"];
+                    let target: LifecycleTarget =
+                        serde_json::from_value(spec["session_target"].clone())
+                            .map_err(|_| rejected("invalid_resize_target"))?;
+                    if verification.session_target() != Some(&target) {
+                        return Err(rejected("resize_target_mismatch"));
+                    }
+                    let prior = serde_json::from_value(spec["prior"].clone())
+                        .map_err(|_| rejected("invalid_resize_prior"))?;
+                    let desired = serde_json::from_value(spec["desired"].clone())
+                        .map_err(|_| rejected("invalid_resize_mode"))?;
+                    let machine = crate::session_resize::SessionResize::new(
+                        LIFECYCLE_CALLER,
+                        (*request).clone(),
+                        target,
+                        prior,
+                        desired,
+                        request_id,
+                        now_ms,
+                        |_, _, _, _| true,
+                    )
+                    .map_err(rejected)?;
+                    let store = crate::resize_store::DurableResizeStore::new(
+                        LIFECYCLE_CALLER,
+                        machine.intent().clone(),
+                        format!("resize.{request_id}"),
+                        None,
+                        request.remaining_ms.min(30_000),
+                        |_| true,
+                    )
+                    .map_err(rejected)?;
+                    let epoch = crate::receipt_store::VerifiedEpoch::authenticate(
+                        target_epoch(&request.target).to_owned(),
+                        |_| true,
+                    )
+                    .map_err(rejected)?;
+                    let key = crate::durable_store::VerifiedTarget::authenticate(
+                        target_store_key(&request.target).map_err(rejected)?,
+                        |_| true,
+                    )
+                    .map_err(rejected)?;
+                    let mut stream_store = crate::durable_store::VirtualDurableStateStore::new(
+                        epoch,
+                        key,
+                        format!("resize-stream.{request_id}"),
+                        None,
+                        request.remaining_ms.min(30_000),
+                    )
+                    .map_err(rejected)?;
+                    stream_store.start_load().map_err(rejected)?;
+                    return Ok(PendingPhase::ResizePreflight {
+                        request,
+                        machine: Box::new(machine),
+                        store: Box::new(store),
+                        stream_store: Box::new(stream_store),
                     });
                 }
                 if !matches!(
@@ -1381,10 +1658,125 @@ fn advance_phase(
                 guard: Box::new(LiveEffectGuard::default()),
             })
         }
+        PendingPhase::ResizePreflight {
+            request,
+            machine,
+            store,
+            mut stream_store,
+        } => {
+            stream_store.advance(now_ms, send);
+            match stream_store.poll_load() {
+                LoadProgress::Waiting => Ok(PendingPhase::ResizePreflight {
+                    request,
+                    machine,
+                    store,
+                    stream_store,
+                }),
+                LoadProgress::Absent => Ok(PendingPhase::ResizeReserve {
+                    request,
+                    machine,
+                    store,
+                    stream_store,
+                }),
+                LoadProgress::Found(prior)
+                    if prior.reference_released && prior.borrow.is_none() =>
+                {
+                    Ok(PendingPhase::ResizeReserve {
+                        request,
+                        machine,
+                        store,
+                        stream_store,
+                    })
+                }
+                _ => Err(recovery("resize_stream_ownership_unknown")),
+            }
+        }
+        PendingPhase::ResizeReserve {
+            request,
+            machine,
+            store,
+            mut stream_store,
+        } => {
+            use crate::virtual_callback::DurableVirtualStore;
+            stream_store.advance(now_ms, send);
+            let fingerprint =
+                crate::virtual_callback::receipt_request_fingerprint(&request).map_err(rejected)?;
+            let command = crate::virtual_callback::StoreCommand::Reserve {
+                sequence: request.provider_sequence,
+                operation_id: request.operation_id.clone(),
+                request: fingerprint,
+            };
+            match stream_store.poll(&command) {
+                crate::virtual_callback::StoreProgress::Waiting => {
+                    Ok(PendingPhase::ResizeReserve {
+                        request,
+                        machine,
+                        store,
+                        stream_store,
+                    })
+                }
+                crate::virtual_callback::StoreProgress::Reserved => Ok(PendingPhase::Resize {
+                    request,
+                    machine,
+                    store,
+                    stream_store,
+                    guard: Box::new(LiveResizeGuard::default()),
+                }),
+                _ => Err(recovery("resize_receipt_reconciliation_required")),
+            }
+        }
+        PendingPhase::Resize {
+            request,
+            mut machine,
+            mut store,
+            stream_store,
+            mut guard,
+        } => {
+            store.advance(now_ms, send);
+            match machine.poll(now_ms, send, &mut *store, &mut *guard) {
+                crate::session_resize::ResizeProgress::Waiting => Ok(PendingPhase::Resize {
+                    request,
+                    machine,
+                    store,
+                    stream_store,
+                    guard,
+                }),
+                crate::session_resize::ResizeProgress::RecoveryRequired => {
+                    Err(recovery("resize_reconciliation_required"))
+                }
+                crate::session_resize::ResizeProgress::Complete(updated) => {
+                    let intent = machine.intent().clone();
+                    let obligations = admitted_obligations(&request).map_err(rejected)?;
+                    let mut callback = crate::virtual_callback::VirtualCallback::new(
+                        LIFECYCLE_CALLER,
+                        *request,
+                        None,
+                        |_| true,
+                        now_ms,
+                        Some(request_id),
+                    )
+                    .map_err(rejected)?;
+                    callback
+                        .attach_resize_result(&intent, &updated, |_, _| true)
+                        .map_err(rejected)?;
+                    callback
+                        .accept_reserved_resize_receipt()
+                        .map_err(rejected)?;
+                    Ok(PendingPhase::Virtual {
+                        machine: Box::new(callback),
+                        store: stream_store,
+                        obligations,
+                        guard: Box::new(LiveEffectGuard::default()),
+                    })
+                }
+            }
+        }
         PendingPhase::VirtualLoad { request, mut store } => {
             store.advance(now_ms, send);
             let prior = match store.poll_load() {
-                LoadProgress::Waiting => return Ok(PendingPhase::VirtualLoad { request, store }),
+                LoadProgress::Waiting => {
+                    return Ok(PendingPhase::VirtualLoad { request, store });
+                }
                 LoadProgress::Found(prior) if !preparing(&request) => Some(prior),
                 LoadProgress::Found(prior)
                     if preparing(&request)
@@ -1787,16 +2179,19 @@ mod tests {
         let prior: crate::virtual_callback::VirtualObligation =
             serde_json::from_value(plan.constraints["virtual_display"].clone()).unwrap();
         let owned = plan.obligations.clone();
+        let envelope = crate::resize_store::decode_envelope(json!(prior)).unwrap();
+        let target = request.target;
         assert_eq!(
-            prior_virtual_cleanup(&prior, std::slice::from_ref(&plan), &owned).unwrap(),
+            prior_virtual_cleanup(&envelope, &target, std::slice::from_ref(&plan), &owned).unwrap(),
             owned[0]
         );
         assert_eq!(
-            prior_virtual_cleanup(&prior, std::slice::from_ref(&plan), &[]).unwrap_err(),
+            prior_virtual_cleanup(&envelope, &target, std::slice::from_ref(&plan), &[])
+                .unwrap_err(),
             "release_prior_plan_unavailable"
         );
         assert_eq!(
-            prior_virtual_cleanup(&prior, &[plan.clone(), plan], &owned).unwrap_err(),
+            prior_virtual_cleanup(&envelope, &target, &[plan.clone(), plan], &owned).unwrap_err(),
             "release_prior_plan_ambiguous"
         );
     }
@@ -1814,6 +2209,10 @@ mod tests {
         check_count: usize,
         borrow_invalid: bool,
         action_description: Option<Value>,
+        verification_metadata: Option<Value>,
+        resize_test: bool,
+        resized: bool,
+        stream_created: bool,
         action_collections: std::collections::BTreeMap<
             String,
             (u64, Value, std::collections::BTreeMap<String, Value>),
@@ -1919,6 +2318,11 @@ mod tests {
                     } else if service == "amaterasu.session-lifecycle/1" {
                         let mut answer = payload;
                         answer["status"] = "succeeded".into();
+                        if let Some(metadata) = &self.verification_metadata {
+                            for (key, value) in metadata.as_object().unwrap() {
+                                answer[key] = value.clone();
+                            }
+                        }
                         match answer["target"]["kind"].as_str() {
                             Some("session") => answer["session_target"] = answer["target"].clone(),
                             Some("stream") => {
@@ -1930,30 +2334,66 @@ mod tests {
                     } else if service == "amaterasu.virtual-display/1" {
                         let action = payload["action"].as_str().unwrap();
                         self.effects.push(action.into());
-                        let domain = json!({"id":"provider_session:abcdef","revision":2,"borrowers":1,"pending_mutations":0,"scope":"provider_session"});
-                        match action {
-                            "status" => {
-                                json!({"ok":true,"enabled":true,"native_supported":true,"recovery_ready":true,"mutation_domain":domain})
+                        let domain = if self.resize_test && self.resized {
+                            json!({"id":"provider_session:abcdef","revision":if self.stream_created {4} else {3},"borrowers":if self.stream_created {2} else {1},"pending_mutations":0,"scope":"provider_session"})
+                        } else {
+                            json!({"id":"provider_session:abcdef","revision":2,"borrowers":1,"pending_mutations":0,"scope":"provider_session"})
+                        };
+                        if self.resize_test {
+                            match action {
+                                "reconfigure" => {
+                                    assert_eq!(self.metadata["pending"], 1);
+                                    assert!(
+                                        self.values
+                                            .values()
+                                            .any(|v| v["active"]["state"] == "pending")
+                                    );
+                                    assert_eq!(payload["expected_topology_revision"], 2);
+                                    self.resized = true;
+                                    json!({"ok":true,"state":"succeeded","operation_id":payload["operation_id"],"borrow_id":"c".repeat(64),"observed_output":{"version":1,"protocol":"wayland-wl-output","compositor_id":"b".repeat(64),"registry_global":4,"output_name":"Virtual-1","width":1280,"height":720,"refresh_millihz":60000},"mutation_domain":{"id":"provider_session:abcdef","revision":3,"borrowers":1,"pending_mutations":0,"scope":"provider_session"}})
+                                }
+                                "reconfigure_status" => {
+                                    assert!(self.resized);
+                                    json!({"ok":true,"state":"succeeded","operation_id":payload["operation_id"],"borrow_id":"c".repeat(64),"observed_output":{"version":1,"protocol":"wayland-wl-output","compositor_id":"b".repeat(64),"registry_global":4,"output_name":"Virtual-1","width":1280,"height":720,"refresh_millihz":60000},"mutation_domain":{"id":"provider_session:abcdef","revision":3,"borrowers":1,"pending_mutations":0,"scope":"provider_session"}})
+                                }
+                                "create" => {
+                                    assert_eq!(payload["expected_topology_revision"], 3);
+                                    assert!(self.values.values().any(|v| v["active"].is_null()
+                                        && v["lineage"][0].is_object()
+                                        && v["obligation"]["width"] == 1280));
+                                    self.stream_created = true;
+                                    json!({"ok":true,"reference_owned":true,"monitor":{"specification":{"identity":"9c1d707f-7229-4fc4-b6e2-91f80c626a09","width":1280,"height":720,"refresh_millihz":60000,"name":"Amaterasu","hdr_enabled":false},"virtual_display_layout":"extended","dd_virtual_display_scale":0,"state":"ready","error":null,"ready":{"device_path":"Virtual-1","active":true},"capture_output":"kwin:Virtual-1"}})
+                                }
+                                "borrow" | "validate_borrow" => {
+                                    json!({"ok":true,"borrow_id":if self.stream_created {"d".repeat(64)} else {"c".repeat(64)},"observed_output":{"version":1,"protocol":"wayland-wl-output","compositor_id":"b".repeat(64),"registry_global":4,"output_name":"Virtual-1","width":1280,"height":720,"refresh_millihz":60000},"mutation_domain":domain})
+                                }
+                                _ => panic!("unexpected resize action {action}"),
                             }
-                            "create" => {
-                                assert!(self.metadata["pending"] == 1);
-                                assert!(self.values.values().any(|value| value["identity"]
-                                    == "9c1d707f-7229-4fc4-b6e2-91f80c626a09"));
-                                json!({"ok":true,"reference_owned":true,"monitor":{"specification":{"identity":"9c1d707f-7229-4fc4-b6e2-91f80c626a09","width":1920,"height":1080,"refresh_millihz":60000,"name":"Amaterasu","hdr_enabled":false},"virtual_display_layout":"extended","dd_virtual_display_scale":0,"state":"ready","error":null,"ready":{"device_path":"Virtual-1","active":true},"capture_output":"kwin:Virtual-1"}})
+                        } else {
+                            match action {
+                                "status" => {
+                                    json!({"ok":true,"enabled":true,"native_supported":true,"recovery_ready":true,"mutation_domain":domain})
+                                }
+                                "create" => {
+                                    assert!(self.metadata["pending"] == 1);
+                                    assert!(self.values.values().any(|value| value["identity"]
+                                        == "9c1d707f-7229-4fc4-b6e2-91f80c626a09"));
+                                    json!({"ok":true,"reference_owned":true,"monitor":{"specification":{"identity":"9c1d707f-7229-4fc4-b6e2-91f80c626a09","width":1920,"height":1080,"refresh_millihz":60000,"name":"Amaterasu","hdr_enabled":false},"virtual_display_layout":"extended","dd_virtual_display_scale":0,"state":"ready","error":null,"ready":{"device_path":"Virtual-1","active":true},"capture_output":"kwin:Virtual-1"}})
+                                }
+                                "validate_borrow" if self.borrow_invalid => {
+                                    json!({"ok":false,"code":"borrow_invalid"})
+                                }
+                                "borrow" | "validate_borrow" => {
+                                    json!({"ok":true,"borrow_id":"a".repeat(64),"observed_output":{"version":1,"protocol":"wayland-wl-output","compositor_id":"b".repeat(64),"registry_global":4,"output_name":"Virtual-1","width":1920,"height":1080,"refresh_millihz":60000},"mutation_domain":domain})
+                                }
+                                "release_borrow" => {
+                                    json!({"ok":true,"released":true,"mutation_domain":domain})
+                                }
+                                "remove" => {
+                                    json!({"ok":true,"removed":true,"identity":"9c1d707f-7229-4fc4-b6e2-91f80c626a09"})
+                                }
+                                _ => panic!("unexpected provider operation"),
                             }
-                            "validate_borrow" if self.borrow_invalid => {
-                                json!({"ok":false,"code":"borrow_invalid"})
-                            }
-                            "borrow" | "validate_borrow" => {
-                                json!({"ok":true,"borrow_id":"a".repeat(64),"observed_output":{"version":1,"protocol":"wayland-wl-output","compositor_id":"b".repeat(64),"registry_global":4,"output_name":"Virtual-1","width":1920,"height":1080,"refresh_millihz":60000},"mutation_domain":domain})
-                            }
-                            "release_borrow" => {
-                                json!({"ok":true,"released":true,"mutation_domain":domain})
-                            }
-                            "remove" => {
-                                json!({"ok":true,"removed":true,"identity":"9c1d707f-7229-4fc4-b6e2-91f80c626a09"})
-                            }
-                            _ => panic!("unexpected provider operation"),
                         }
                     } else {
                         panic!("unexpected service {service}")
@@ -2015,6 +2455,124 @@ mod tests {
             }
             panic!("effect did not settle")
         }
+    }
+    #[test]
+    fn resumed_resize_is_durable_before_new_stream_candidate() {
+        let mut request = callback_request();
+        let session: LifecycleTarget = serde_json::from_value(json!({"kind":"session","host_epoch":"epoch-1","session_id":"session-1","generation":1})).unwrap();
+        let mut prior =
+            request.approved_plan.as_ref().unwrap().constraints["virtual_display"].clone();
+        prior["reference_id"] = json!("session-ref");
+        prior["geometry_revision"] = json!(1);
+        prior["borrow"] = json!({"borrow_id":"a".repeat(64),"observed_output":{"version":1,"protocol":"wayland-wl-output","compositor_id":"b".repeat(64),"registry_global":4,"output_name":"Virtual-1","width":1920,"height":1080,"refresh_millihz":60000},"mutation_domain":{"id":"provider_session:abcdef","revision":2,"borrowers":1,"pending_mutations":0,"scope":"provider_session"}});
+        let desired = json!({"width":1280,"height":720,"refresh_millihz":60000,"hdr":false});
+        let plan = request.approved_plan.as_mut().unwrap();
+        plan.constraints["virtual_display"]["width"] = json!(1280);
+        plan.constraints["virtual_display"]["height"] = json!(720);
+        plan.constraints["virtual_reconfigure"] =
+            json!({"session_target":session,"prior":prior,"desired":desired});
+        plan.constraints["geometry_source"] = json!("native_readback");
+        plan.candidate_constraint.as_mut().unwrap().mode =
+            Some(serde_json::from_value(desired).unwrap());
+        let key = format!(
+            "virtual-obligation/v1/{}",
+            target_store_key(&session).unwrap()
+        );
+        let mut broker = FakeBroker {
+            resize_test: true,
+            verification_metadata: Some(json!({"consumers_retired":true})),
+            ..Default::default()
+        };
+        broker.values.insert(key.clone(), prior.clone());
+        let result = broker.drive_effect(request.clone());
+        assert_eq!(result["status"], "prepared", "{result}");
+        assert_eq!(result["candidate"]["mode"]["width"], 1280);
+        assert_eq!(result["candidate"]["geometry_revision"], 3);
+        assert!(broker.values[&key]["lineage"][0].is_object());
+        assert!(broker.values[&key]["active"].is_null());
+        assert_eq!(broker.values[&key]["obligation"]["width"], 1280);
+        let envelope = crate::resize_store::decode_envelope(broker.values[&key].clone()).unwrap();
+        let mut original = request.approved_plan.clone().unwrap();
+        let mut original_selection = prior.clone();
+        original_selection["borrow"] = Value::Null;
+        original.constraints = json!({"virtual_display":original_selection});
+        original.obligations[0].payload["reference_id"] = json!("session-ref");
+        let original_obligations = original.obligations.clone();
+        assert_eq!(
+            prior_virtual_cleanup(&envelope, &session, &[original], &original_obligations).unwrap(),
+            original_obligations[0]
+        );
+        assert!(
+            broker
+                .effects
+                .iter()
+                .position(|e| e == "reconfigure")
+                .unwrap()
+                < broker.effects.iter().position(|e| e == "create").unwrap()
+        );
+        let mut oversized = request.clone();
+        oversized.settings.insert(
+            "padding".into(),
+            json!("x".repeat(crate::receipt_store::MAX_REQUEST_BYTES)),
+        );
+        let mut preflight = FakeBroker {
+            resize_test: true,
+            verification_metadata: Some(json!({"consumers_retired":true})),
+            ..Default::default()
+        };
+        preflight.values.insert(key.clone(), prior.clone());
+        let rejected = preflight.drive_effect(oversized);
+        assert_eq!(rejected["reason"], "receipt_request_too_large");
+        assert!(preflight.effects.is_empty());
+        let mut interrupted = FakeBroker {
+            resize_test: true,
+            verification_metadata: Some(json!({"consumers_retired":true})),
+            deny_after_checks: Some(2),
+            ..Default::default()
+        };
+        interrupted.values.insert(key.clone(), prior.clone());
+        let failed = interrupted.drive_effect(request.clone());
+        assert_eq!(failed["status"], "recovery_required", "{failed}");
+        assert_eq!(
+            interrupted
+                .effects
+                .iter()
+                .filter(|effect| *effect == "reconfigure")
+                .count(),
+            1
+        );
+        assert_eq!(interrupted.values[&key]["active"]["state"], "committed");
+        interrupted.deny_after_checks = None;
+        let recovered = interrupted.status(request.provider_sequence, &request.operation_id);
+        assert_eq!(
+            recovered["reason"], "resize_reconciled_stream_incomplete",
+            "{recovered}"
+        );
+        assert!(interrupted.values[&key]["active"].is_null());
+        assert_eq!(
+            interrupted
+                .effects
+                .iter()
+                .filter(|effect| *effect == "reconfigure")
+                .count(),
+            1
+        );
+        assert!(
+            interrupted
+                .effects
+                .iter()
+                .any(|effect| effect == "reconfigure_status")
+        );
+        assert!(!interrupted.effects.iter().any(|effect| effect == "create"));
+        let mut denied = FakeBroker {
+            resize_test: true,
+            verification_metadata: Some(json!({"consumers_retired":false})),
+            ..Default::default()
+        };
+        denied.values.insert(key, prior);
+        let result = denied.drive_effect(request);
+        assert_ne!(result["status"], "prepared");
+        assert!(denied.effects.is_empty());
     }
     #[test]
     fn verified_virtual_prepare_and_release_persist_before_native_effects() {
@@ -2096,7 +2654,7 @@ mod tests {
         request.settings.insert("enabled".into(), json!(true));
         let mut missing = FakeBroker::default();
         let result = missing.drive_effect(request.clone());
-        assert_eq!(result["reason"], "session_ownership_unverified");
+        assert_eq!(result["reason"], "prepare_plans_unavailable");
         assert!(missing.effects.is_empty());
 
         let mut broker = FakeBroker::default();
@@ -2122,7 +2680,19 @@ mod tests {
                 "virtual-obligation/v1/{}",
                 target_store_key(&session).unwrap()
             ),
-            obligation,
+            obligation.clone(),
+        );
+        let mut plan = serde_json::to_value(callback_request().approved_plan.unwrap()).unwrap();
+        let mut constraint = obligation.clone();
+        constraint["borrow"] = Value::Null;
+        plan["constraints"]["virtual_display"] = constraint;
+        plan["resources"][0]["resource_id"] = obligation["identity"].clone();
+        plan["candidate_constraint"]["resource_id"] = obligation["identity"].clone();
+        plan["obligations"][0]["resource_id"] = obligation["identity"].clone();
+        plan["obligations"][0]["payload"]["identity"] = obligation["identity"].clone();
+        plan["obligations"][0]["payload"]["reference_id"] = obligation["reference_id"].clone();
+        broker.verification_metadata = Some(
+            json!({"admitted_plans":[{"admission_id":"session-prepare","target":session,"phase":"session.prepare","plan":plan}],"obligations":plan["obligations"],"consumers_retired":true}),
         );
         broker.effects.clear();
         let verify = PendingVerification::from_request(LIFECYCLE_CALLER, &request, 0).unwrap();

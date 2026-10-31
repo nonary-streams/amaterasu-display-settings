@@ -111,7 +111,6 @@ impl StateDurableStore {
             prefix,
             self.parent,
             self.timeout_ms,
-            self.now_ms,
         ));
         Ok(())
     }
@@ -669,6 +668,35 @@ mod tests {
     fn target() -> VerifiedTarget {
         VerifiedTarget::authenticate("session-1".into(), |_| true).unwrap()
     }
+    #[test]
+    fn fresh_journal_loads_use_the_first_poll_clock() {
+        let mut state = FakeState::default();
+        let mut physical =
+            StateDurableStore::new(epoch(), target(), "physical".into(), None, 5_000).unwrap();
+        let mut virtual_store =
+            VirtualDurableStateStore::new(epoch(), target(), "virtual".into(), None, 5_000)
+                .unwrap();
+        physical.start_load().unwrap();
+        virtual_store.start_load().unwrap();
+        for now in 40_000..40_010 {
+            physical.advance(now, &mut |command| state.send(command));
+        }
+        assert_eq!(physical.poll_load(), LoadProgress::Absent);
+        for now in 40_000..40_010 {
+            virtual_store.advance(now, &mut |command| state.send(command));
+        }
+        assert_eq!(virtual_store.poll_load(), LoadProgress::Absent);
+
+        let mut stuck = LoadOperation::new("key".into(), "stuck".into(), None, 5_000);
+        assert!(matches!(
+            stuck.advance(40_000, &mut |_| Err("unavailable".into())),
+            LoadStep::Waiting
+        ));
+        assert!(matches!(
+            stuck.advance(45_000, &mut |_| unreachable!()),
+            LoadStep::Done(Err(()))
+        ));
+    }
     fn obligation() -> RecoveryObligation {
         RecoveryObligation::new(
             "operation-1".into(),
@@ -1040,17 +1068,30 @@ impl VirtualDurableStateStore {
             prefix,
             self.parent,
             self.timeout_ms,
-            self.now_ms,
         ));
         Ok(())
     }
     pub fn poll_load(&mut self) -> LoadProgress<VirtualObligation> {
+        match self.poll_load_envelope() {
+            LoadProgress::Waiting => LoadProgress::Waiting,
+            LoadProgress::Absent => LoadProgress::Absent,
+            LoadProgress::Unknown => LoadProgress::Unknown,
+            LoadProgress::Found(envelope) => LoadProgress::Found(envelope.obligation),
+        }
+    }
+    /// Return a completed resize lineage together with its current obligation.
+    /// Any unresolved intent fences every ordinary reader.
+    pub fn poll_load_envelope(&mut self) -> LoadProgress<crate::resize_store::ResizeEnvelope> {
         if self.poisoned {
             return LoadProgress::Unknown;
         }
         match self.load_ready.take() {
-            Some(Some(value)) => match serde_json::from_value::<VirtualObligation>(value) {
-                Ok(obligation) if valid_virtual(&obligation) => LoadProgress::Found(obligation),
+            Some(Some(value)) => match crate::resize_store::decode_envelope(value) {
+                Ok(envelope)
+                    if envelope.active.is_none() && valid_virtual(&envelope.obligation) =>
+                {
+                    LoadProgress::Found(envelope)
+                }
                 _ => {
                     self.poisoned = true;
                     LoadProgress::Unknown
@@ -1581,15 +1622,19 @@ impl VirtualJournal {
                 let Some(value) = payload.get("value") else {
                     return VirtualJournalProgress::Done(StoreProgress::Unknown);
                 };
+                let mut envelope = None;
                 let current = if found {
-                    let Ok(value) = serde_json::from_value::<VirtualObligation>(value.clone())
-                    else {
+                    let Ok(record) = crate::resize_store::decode_envelope(value.clone()) else {
                         return VirtualJournalProgress::Done(StoreProgress::Unknown);
                     };
-                    if !valid_virtual(&value) {
+                    if record.active.is_some() || !valid_virtual(&record.obligation) {
                         return VirtualJournalProgress::Done(StoreProgress::Unknown);
                     }
-                    Some(value)
+                    let obligation = record.obligation.clone();
+                    if value.get("format_version").is_some() {
+                        envelope = Some(record);
+                    }
+                    Some(obligation)
                 } else if value.is_null() {
                     None
                 } else {
@@ -1610,12 +1655,23 @@ impl VirtualJournal {
                         let Some(next) = revision.checked_add(1) else {
                             return VirtualJournalProgress::Done(StoreProgress::Unknown);
                         };
+                        let next_value = if let Some(mut record) = envelope {
+                            record.obligation = obligation.clone();
+                            match serde_json::to_value(record) {
+                                Ok(value) => value,
+                                Err(_) => {
+                                    return VirtualJournalProgress::Done(StoreProgress::Unknown);
+                                }
+                            }
+                        } else {
+                            json!(obligation)
+                        };
                         self.expected_revision = Some(next);
                         self.stage = JournalStage::Write;
                         self.exchange = Exchange {
                             command: Command::Request {
                                 service: SERVICE.into(),
-                                payload: json!({"action":"set","key":self.key,"value":obligation,"expected_revision":revision}),
+                                payload: json!({"action":"set","key":self.key,"value":next_value,"expected_revision":revision}),
                                 timeout_ms,
                                 operation_id: format!(
                                     "{}.write.{}",
@@ -2042,14 +2098,15 @@ pub enum LoadProgress<T> {
 }
 struct LoadOperation {
     exchange: Exchange,
-    deadline_ms: u64,
+    deadline_ms: Option<u64>,
+    timeout_ms: u64,
 }
 enum LoadStep {
     Waiting,
     Done(Result<Option<Value>, ()>),
 }
 impl LoadOperation {
-    fn new(key: String, prefix: String, parent: Option<u64>, timeout_ms: u64, now_ms: u64) -> Self {
+    fn new(key: String, prefix: String, parent: Option<u64>, timeout_ms: u64) -> Self {
         Self {
             exchange: Exchange {
                 command: Command::Request {
@@ -2064,7 +2121,8 @@ impl LoadOperation {
                 failures: 0,
                 uncertain: false,
             },
-            deadline_ms: now_ms.saturating_add(timeout_ms),
+            deadline_ms: None,
+            timeout_ms,
         }
     }
     fn advance(
@@ -2072,7 +2130,10 @@ impl LoadOperation {
         now_ms: u64,
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
     ) -> LoadStep {
-        if now_ms >= self.deadline_ms || self.exchange.failures >= MAX_FAILURES {
+        let deadline_ms = *self
+            .deadline_ms
+            .get_or_insert_with(|| now_ms.saturating_add(self.timeout_ms));
+        if now_ms >= deadline_ms || self.exchange.failures >= MAX_FAILURES {
             return LoadStep::Done(Err(()));
         }
         if let Some(id) = self.exchange.request_id {

@@ -44,6 +44,7 @@ struct Owned {
     target: LifecycleTarget,
     planned: VirtualObligation,
     execution_domain: String,
+    refined_geometry: bool,
     journal: Option<VirtualObligation>,
     before: Option<VirtualObligation>,
 }
@@ -157,6 +158,13 @@ impl ObservationRefresh {
                 target: p.target,
                 planned,
                 execution_domain: matching[0].execution_domain.clone(),
+                refined_geometry: p
+                    .plan
+                    .constraints
+                    .get("geometry_source")
+                    .and_then(Value::as_str)
+                    == Some("native_readback")
+                    && p.plan.constraints.get("virtual_reconfigure").is_some(),
                 journal: None,
                 before: None,
             });
@@ -279,16 +287,21 @@ impl ObservationRefresh {
                 if value["ok"] != true || value["found"] != true {
                     return self.finish(RefreshProgress::Unknown);
                 }
-                let Ok(saved) = serde_json::from_value::<VirtualObligation>(value["value"].clone())
+                let Ok(envelope) = crate::resize_store::decode_envelope(value["value"].clone())
                 else {
                     return self.finish(RefreshProgress::Unknown);
                 };
-                let mut comparable = saved.clone();
-                comparable.borrow = None;
-                let planned = &self.owned[self.index].planned;
-                if comparable != *planned || saved.reference_released || saved.borrow.is_none() {
+                let owned = &self.owned[self.index];
+                let mut planned = owned.planned.clone();
+                if owned.refined_geometry {
+                    planned.geometry_revision = envelope.obligation.geometry_revision;
+                }
+                if !crate::virtual_callback::lineage_authorizes(&envelope, &owned.target, &planned)
+                    || envelope.obligation.borrow.is_none()
+                {
                     return self.finish(RefreshProgress::Unknown);
                 }
+                let saved = envelope.obligation;
                 let borrow = saved.borrow.as_ref().expect("checked");
                 let payload = json!({"action":"validate_borrow","identity":saved.identity,"reference_id":saved.reference_id,"borrow_id":borrow.borrow_id});
                 self.owned[self.index].before = Some(saved.clone());
@@ -406,6 +419,36 @@ impl ObservationRefresh {
         let mut borrowers = BTreeMap::new();
         let mut resources = BTreeMap::new();
         let mut borrow_ids = BTreeSet::new();
+        for stream in self.owned.iter().filter(|owned| owned.refined_geometry) {
+            let LifecycleTarget::Stream {
+                host_epoch,
+                session_id,
+                ..
+            } = &stream.target
+            else {
+                return None;
+            };
+            let saved = stream.journal.as_ref()?;
+            let session = self.owned.iter().find(|candidate| matches!(&candidate.target, LifecycleTarget::Session { host_epoch: epoch, session_id: id, .. } if epoch == host_epoch && id == session_id))?.journal.as_ref()?;
+            let a = saved.borrow.as_ref()?;
+            let b = session.borrow.as_ref()?;
+            if saved.geometry_revision != session.geometry_revision
+                || saved.width != session.width
+                || saved.height != session.height
+                || saved.refresh_millihz != session.refresh_millihz
+                || crate::virtual_callback::producer_incarnation(
+                    &saved.domain_id,
+                    &saved.identity,
+                    &a.observed_output,
+                ) != crate::virtual_callback::producer_incarnation(
+                    &session.domain_id,
+                    &session.identity,
+                    &b.observed_output,
+                )
+            {
+                return None;
+            }
+        }
         for owned in &self.owned {
             let saved = owned.journal.as_ref()?;
             let borrow = saved.borrow.as_ref()?;
@@ -621,6 +664,29 @@ mod tests {
             }
         }
         panic!("stuck")
+    }
+    #[test]
+    fn refined_stream_geometry_requires_matching_session_readback() {
+        let (target, plans, obligations, saved) = fixture();
+        let mut machine =
+            ObservationRefresh::new(target, plans, obligations, None, 5000, 0, |_, _, _| true)
+                .unwrap();
+        machine.owned[0].refined_geometry = true;
+        machine.owned[0].journal = Some(saved.clone());
+        let mut session = saved.clone();
+        session.reference_id = "session-ref".into();
+        session.borrow.as_mut().unwrap().borrow_id = "c".repeat(64);
+        machine.owned.push(Owned { target: serde_json::from_value(json!({"kind":"session","host_epoch":"epoch-1","session_id":"session-1","generation":1})).unwrap(), planned: session.clone(), execution_domain:"desktop".into(), refined_geometry:false, journal:Some(session), before:None });
+        machine.domain = Some(MutationDomain {
+            id: DOMAIN.into(),
+            revision: 2,
+            borrowers: 2,
+            pending_mutations: 0,
+            scope: "provider_session".into(),
+        });
+        assert!(machine.refresh_payload().is_some());
+        machine.owned[1].journal.as_mut().unwrap().geometry_revision += 1;
+        assert!(machine.refresh_payload().is_none());
     }
     #[test]
     fn release_plans_are_not_live_ownership_evidence() {
