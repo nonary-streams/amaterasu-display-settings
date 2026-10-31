@@ -2360,7 +2360,7 @@ impl PriorReceiptLookup {
         if !found || revision == 0 {
             return PriorReceiptProgress::Unknown;
         }
-        let (Some(2), Some(epoch), Some(low), Some(high), Some(pending)) = (
+        let (Some(version), Some(epoch), Some(low), Some(high), Some(pending)) = (
             metadata.get("format_version").and_then(Value::as_u64),
             metadata.get("epoch").and_then(Value::as_str),
             metadata.get("low").and_then(Value::as_u64),
@@ -2369,8 +2369,7 @@ impl PriorReceiptLookup {
         ) else {
             return PriorReceiptProgress::Unknown;
         };
-        if metadata.as_object().is_none_or(|obj| obj.len() != 5)
-            || epoch.is_empty()
+        if epoch.is_empty()
             || epoch.len() > 80
             || !epoch.bytes().all(|b| {
                 b.is_ascii_lowercase()
@@ -2378,18 +2377,65 @@ impl PriorReceiptLookup {
                     || matches!(b, b'.' | b'_' | b'-' | b'/')
             })
             || low > high
-            || high - low > 64
-            || count != high - low
             || pending > 1
             || pending > count
         {
             return PriorReceiptProgress::Unknown;
         }
+        if self.sequence > high {
+            return PriorReceiptProgress::Unknown;
+        }
+        let retained = match version {
+            2 if metadata.as_object().is_some_and(|obj| obj.len() == 5)
+                && high - low <= 64
+                && count == high - low =>
+            {
+                true
+            }
+            3 => {
+                let Some(object) = metadata.as_object() else {
+                    return PriorReceiptProgress::Unknown;
+                };
+                if (object.len() != 5 && object.len() != 6)
+                    || object.keys().any(|key| {
+                        !matches!(
+                            key.as_str(),
+                            "format_version" | "epoch" | "low" | "high" | "pending" | "sequences"
+                        )
+                    })
+                {
+                    return PriorReceiptProgress::Unknown;
+                }
+                let sequences: Vec<u64> = match object.get("sequences") {
+                    None => Vec::new(),
+                    Some(value) => match serde_json::from_value(value.clone()) {
+                        Ok(sequences) => sequences,
+                        Err(_) => return PriorReceiptProgress::Unknown,
+                    },
+                };
+                if sequences.len() > 64
+                    || sequences.len() as u64 != count
+                    || sequences
+                        .iter()
+                        .any(|sequence| *sequence <= low || *sequence > high)
+                    || sequences.windows(2).any(|pair| pair[0] >= pair[1])
+                    || sequences.last().copied().unwrap_or(low) != high
+                {
+                    return PriorReceiptProgress::Unknown;
+                }
+                sequences.binary_search(&self.sequence).is_ok()
+            }
+            _ => return PriorReceiptProgress::Unknown,
+        };
         if self.sequence <= low {
             return PriorReceiptProgress::Expired;
         }
-        if self.sequence > high {
-            return PriorReceiptProgress::Unknown;
+        if !retained {
+            return if payload.get("value").is_some_and(Value::is_null) {
+                PriorReceiptProgress::Expired
+            } else {
+                PriorReceiptProgress::Unknown
+            };
         }
         let Some(value) = payload.get("value") else {
             return PriorReceiptProgress::Unknown;
@@ -2493,6 +2539,15 @@ mod prior_receipt_tests {
         assert_eq!(run(response(value)), PriorReceiptProgress::Unknown);
         let expired = json!({"ok":true,"revision":2,"found":true,"count":0,"metadata":{"format_version":2,"epoch":"new-epoch","low":9,"high":9,"pending":0},"value":null});
         assert_eq!(run(expired), PriorReceiptProgress::Expired);
+    }
+    #[test]
+    fn prior_lookup_accepts_sparse_metadata_and_expires_unseen_gaps() {
+        let value = json!({"operation_id":"operation-9","request":saved_request(),"state":{"state":"pending"}});
+        let metadata = json!({"format_version":3,"epoch":"new-epoch","low":1,"high":12,"pending":1,"sequences":[5,9,12]});
+        let payload = json!({"ok":true,"revision":3,"found":true,"count":3,"metadata":metadata,"value":value});
+        assert!(matches!(run(payload), PriorReceiptProgress::Found { .. }));
+        let gap = json!({"ok":true,"revision":3,"found":true,"count":2,"metadata":{"format_version":3,"epoch":"new-epoch","low":1,"high":12,"pending":0,"sequences":[5,12]},"value":null});
+        assert_eq!(run(gap), PriorReceiptProgress::Expired);
     }
 }
 

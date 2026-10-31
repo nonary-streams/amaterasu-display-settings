@@ -68,25 +68,46 @@ struct Metadata {
     low: u64,
     high: u64,
     pending: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sequences: Vec<u64>,
 }
 impl Metadata {
     fn empty(epoch: String) -> Self {
         Self {
-            format_version: 2,
+            format_version: 3,
             epoch,
             low: 0,
             high: 0,
             pending: 0,
+            sequences: Vec::new(),
         }
     }
     fn validate(&self, count: u64) -> bool {
-        self.format_version == 2
+        self.format_version == 3
             && valid_id(&self.epoch, 80)
             && self.low <= self.high
-            && self.high - self.low <= WINDOW
+            && self.sequences.len() <= WINDOW as usize
             && self.pending <= 1
             && self.pending <= count
-            && count == self.high - self.low
+            && count == self.sequences.len() as u64
+            && self
+                .sequences
+                .iter()
+                .all(|sequence| *sequence > self.low && *sequence <= self.high)
+            && self.sequences.windows(2).all(|pair| pair[0] < pair[1])
+            && self.sequences.last().copied().unwrap_or(self.low) == self.high
+    }
+    fn normalize(&mut self) -> bool {
+        if self.format_version == 2 {
+            if !self.sequences.is_empty() || self.low > self.high || self.high - self.low > WINDOW {
+                return false;
+            }
+            if self.low < self.high {
+                self.sequences = (self.low + 1..=self.high).collect();
+            }
+            self.format_version = 3;
+        }
+        true
     }
 }
 /// Each `Complete` means the callback effect is settled and any remaining
@@ -418,7 +439,7 @@ impl PendingStoreOperation {
             };
             meta
         };
-        if !meta.validate(count) {
+        if !meta.normalize() || !meta.validate(count) {
             return self.done(Outcome::Unknown);
         }
         if meta.epoch != self.operation.epoch() {
@@ -445,9 +466,15 @@ impl PendingStoreOperation {
             if sequence <= meta.low {
                 return self.done(Outcome::Expired);
             }
-            if sequence <= meta.high && existing.is_none()
-                || sequence > meta.high && existing.is_some()
-            {
+            if sequence <= meta.high {
+                let retained = meta.sequences.binary_search(&sequence).is_ok();
+                match (retained, existing.is_some()) {
+                    (false, false) => return self.done(Outcome::Expired),
+                    (true, false) | (false, true) => return self.done(Outcome::Unknown),
+                    (true, true) => {}
+                }
+            }
+            if sequence > meta.high && existing.is_some() {
                 return self.done(Outcome::Unknown);
             }
         }
@@ -456,14 +483,14 @@ impl PendingStoreOperation {
             (Operation::Lookup { .. }, None) => return self.done(Outcome::NotFound),
             (Operation::Lookup { .. }, Some(r)) => return self.done(receipt_outcome(r)),
             (Operation::Begin { sequence, .. }, None) => {
-                if meta.high.checked_add(1) != Some(*sequence) {
+                if *sequence <= meta.high {
                     return self.done(Outcome::SequenceWindow);
                 }
                 if meta.pending != 0 {
                     return self.done(Outcome::SequenceWindow);
                 }
                 if count >= WINDOW {
-                    let Some(oldest) = meta.low.checked_add(1) else {
+                    let Some(&oldest) = meta.sequences.first() else {
                         return self.done(Outcome::Unknown);
                     };
                     self.retirement = Some((meta, revision));
@@ -473,6 +500,7 @@ impl PendingStoreOperation {
                 }
                 meta.high = *sequence;
                 meta.pending += 1;
+                meta.sequences.push(*sequence);
                 let receipt = self.operation.receipt(ReceiptState::Pending);
                 edits.push(json!({"key":self.operation.key(),"value":receipt}));
                 Outcome::Begun
@@ -522,13 +550,14 @@ impl PendingStoreOperation {
                 Outcome::Completed(receipt)
             }
             (Operation::Retire { sequence, .. }, Some(r)) => {
-                if meta.low.checked_add(1) != Some(*sequence) {
+                if meta.sequences.first().copied() != Some(*sequence) {
                     return self.done(Outcome::SequenceWindow);
                 }
                 if matches!(r.state, ReceiptState::Pending) {
                     return self.done(Outcome::RecoveryRequired(r));
                 }
                 meta.low = *sequence;
+                meta.sequences.remove(0);
                 edits.push(json!({"key":self.operation.key(),"value":null}));
                 Outcome::Retired
             }
@@ -568,7 +597,8 @@ impl PendingStoreOperation {
         let observed = payload
             .get("metadata")
             .cloned()
-            .and_then(|v| serde_json::from_value::<Metadata>(v).ok());
+            .and_then(|v| serde_json::from_value::<Metadata>(v).ok())
+            .and_then(|mut v| v.normalize().then_some(v));
         if payload.get("found").and_then(Value::as_bool) != Some(true)
             || payload.get("count").and_then(Value::as_u64) != Some(WINDOW)
             || observed.as_ref() != Some(&metadata)
@@ -592,19 +622,21 @@ impl PendingStoreOperation {
         };
         if !matches!(self.operation, Operation::Begin { .. })
             || metadata.pending != 0
-            || metadata.high.checked_add(1) != Some(sequence)
+            || sequence <= metadata.high
         {
             return self.done(Outcome::Unknown);
         }
-        let Some(low) = metadata.low.checked_add(1) else {
+        let Some(&low) = metadata.sequences.first() else {
             return self.done(Outcome::Unknown);
         };
         let Some(next_revision) = revision.checked_add(1) else {
             return self.done(Outcome::Unknown);
         };
         metadata.low = low;
+        metadata.sequences.remove(0);
         metadata.high = sequence;
         metadata.pending = 1;
+        metadata.sequences.push(sequence);
         let receipt = self.operation.receipt(ReceiptState::Pending);
         self.write_revision = Some(next_revision);
         self.write_outcome = Some(Outcome::Begun);
@@ -793,6 +825,59 @@ mod tests {
         assert_eq!(state.revision, prior_revision);
         assert!(state.entries.contains_key(&key));
         assert!(!state.entries.contains_key(&format!("{:020}", 65)));
+    }
+    #[test]
+    fn sparse_first_sequence_and_gaps_are_never_replayed() {
+        let mut state = FakeState::default();
+        assert_eq!(state.run(begin("epoch-a", 12)), Outcome::Begun);
+        assert!(matches!(
+            state.run(complete("epoch-a", 12)),
+            Outcome::Completed(_)
+        ));
+        assert_eq!(state.run(begin("epoch-a", 17)), Outcome::Begun);
+        assert_eq!(state.run(begin("epoch-a", 13)), Outcome::Expired);
+        assert_eq!(state.run(lookup("epoch-a", 16)), Outcome::Expired);
+        assert!(matches!(
+            state.run(complete("epoch-a", 17)),
+            Outcome::Completed(_)
+        ));
+        assert_eq!(state.run(retire("epoch-a", 12)), Outcome::Retired);
+        assert_eq!(state.metadata["low"], 12);
+        assert_eq!(state.run(lookup("epoch-a", 12)), Outcome::Expired);
+        assert!(matches!(
+            state.run(lookup("epoch-a", 17)),
+            Outcome::Completed(_)
+        ));
+    }
+    #[test]
+    fn sparse_window_retirement_and_legacy_migration_keep_cas_invariants() {
+        let mut state = FakeState::default();
+        for sequence in (1..=127).step_by(2) {
+            assert_eq!(state.run(begin("epoch-a", sequence)), Outcome::Begun);
+            assert!(matches!(
+                state.run(complete("epoch-a", sequence)),
+                Outcome::Completed(_)
+            ));
+        }
+        state.cas_conflicts = 1;
+        assert_eq!(state.run(begin("epoch-a", 140)), Outcome::Begun);
+        assert_eq!(state.metadata["low"], 1);
+        assert_eq!(state.run(lookup("epoch-a", 2)), Outcome::Expired);
+        assert!(matches!(
+            state.run(lookup("epoch-a", 3)),
+            Outcome::Completed(_)
+        ));
+        let mut legacy = FakeState::default();
+        assert_eq!(legacy.run(begin("epoch-a", 1)), Outcome::Begun);
+        assert!(matches!(
+            legacy.run(complete("epoch-a", 1)),
+            Outcome::Completed(_)
+        ));
+        legacy.metadata["format_version"] = json!(2);
+        legacy.metadata.as_object_mut().unwrap().remove("sequences");
+        assert_eq!(legacy.run(begin("epoch-a", 10)), Outcome::Begun);
+        assert_eq!(legacy.metadata["format_version"], 3);
+        assert_eq!(legacy.metadata["sequences"], json!([1, 10]));
     }
     #[test]
     fn pending_blocks_new_sequence_retirement_and_changed_retry() {
