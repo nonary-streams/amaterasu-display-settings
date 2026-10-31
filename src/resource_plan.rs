@@ -737,8 +737,12 @@ impl Planner {
         let resource = PlannedResource {
             provider: descriptor::PROVIDER.into(),
             resource_id: prior.identity.clone(),
-            incarnation: None,
-            expected_revision: None,
+            incarnation: Some(crate::virtual_callback::producer_incarnation(
+                &prior.domain_id,
+                &prior.identity,
+                &observed,
+            )),
+            expected_revision: Some(domain.expected_revision),
             execution_domain: self.request.consumer_requirements.execution_domain.clone(),
             mutation_domains: vec![prior.domain_id.clone()],
             access: ResourceAccess::Exclusive,
@@ -761,7 +765,11 @@ impl Planner {
                 selector_schema: SELECTOR.into(),
                 resource_provider: descriptor::PROVIDER.into(),
                 resource_id: prior.identity.clone(),
-                incarnation: None,
+                incarnation: Some(crate::virtual_callback::producer_incarnation(
+                    &prior.domain_id,
+                    &prior.identity,
+                    &observed,
+                )),
                 execution_domain: self.request.consumer_requirements.execution_domain.clone(),
                 mode: Some(VideoMode {
                     width: prior.width,
@@ -914,11 +922,18 @@ impl Planner {
             borrow: None,
             reference_released: false,
         };
+        let existing_incarnation = self
+            .session
+            .as_ref()
+            .and_then(|session| session.obligation.borrow.as_ref())
+            .map(|borrow| {
+                crate::virtual_callback::producer_incarnation(id, identity, &borrow.observed_output)
+            });
         let resource = PlannedResource {
             provider: descriptor::PROVIDER.into(),
             resource_id: identity.clone(),
-            incarnation: None,
-            expected_revision: None,
+            incarnation: existing_incarnation.clone(),
+            expected_revision: existing_incarnation.as_ref().map(|_| revision),
             execution_domain: self.request.consumer_requirements.execution_domain.clone(),
             mutation_domains: vec![id.into()],
             access: ResourceAccess::Exclusive,
@@ -928,7 +943,7 @@ impl Planner {
             selector_schema: SELECTOR.into(),
             resource_provider: descriptor::PROVIDER.into(),
             resource_id: identity.clone(),
-            incarnation: None,
+            incarnation: existing_incarnation,
             execution_domain: self.request.consumer_requirements.execution_domain.clone(),
             mode: Some(mode.clone()),
             plan_revision,
@@ -1329,6 +1344,12 @@ mod tests {
             Some(&1)
         );
         assert_eq!(plan.mutation_domains[0].expected_revision, 7);
+        assert!(plan.resources[0].incarnation.is_some());
+        assert_eq!(plan.resources[0].expected_revision, Some(7));
+        assert_eq!(
+            plan.candidate_constraint.as_ref().unwrap().incarnation,
+            plan.resources[0].incarnation
+        );
         assert_ne!(
             plan.constraints["virtual_display"]["reference_id"],
             json!(session_ref)
