@@ -4,29 +4,28 @@ The historical inventory below describes source behavior at Amaterasu `6d4905931
 
 ## Current extension behavior and evidence
 
-The extension resolves display settings for each stream and proposes configuration
-and restoration to a selected resource owner through the coordinator. It does not
-allocate or retain virtual screens and does not advertise the former remove-owned
-action. A compatible v2 producer can supply a physical or virtual target; a physical
-producer and end-to-end platform qualification remain outstanding. Linux and Windows
-native mode, capture, restore, HDR, scaling and compositor behavior require live
-validation. Simulated composed-lifecycle tests are not native or end-to-end
-streaming qualification: the latest simulated run passed initial stream, pause
-and restore, but first resume failed in owner recovery. The Core repository
-provides a non-mutating split export planner; applying and validating an upgrade
-remains an operator task.
+Display-settings resolves stream configuration and proposes owner controls. The
+separate virtual-screen extension owns the session resource and native lease;
+the coordinator authenticates handoffs and orders their cleanup. On pause the
+stream settings are restored while the application and session-owned screen
+remain under the owner's default retention policy. Resume requests settings for a
+new stream. Timed retention, pause enforcement and keepalive are unsupported.
 
-The settings participant configures and restores per stream; session phases do
-not mutate the target. It compares known preserved HDR, scale and layout values,
-and requires an owner-confirmed, snapshot-bound native preservation proof for
-unknown values. Current composed mode configuration is SDR with preserved HDR
-and scale and selected virtual layouts; unsupported requests fail closed. The native Linux mode-only path has
-source and fake-backend test coverage, not live KScreen or hardware qualification.
-There is no v2 physical target producer yet. Revision-1 combined settings and
-owned resources require explicit export, review and retirement before a fresh
-profile is enabled; no automatic migration or lease adoption is performed. The
-split export has been tested with legacy and display-v2 descriptors and a draft
-owner descriptor, but not the latest owner descriptor or a live registry import.
+The composed planner accepts SDR resolution and refresh policy with HDR and scale
+preserved. HDR streams or active HDR, overrides, scale changes and highest-mode
+enumeration are rejected. Virtual layouts are limited to preserve, exclusive and
+extended; physical layout changes are rejected, and no compatible v2 physical
+producer is available. Restored handoffs require a matching snapshot-bound
+preservation proof. Some multi-session cases, native mode and capture behavior,
+and complete streaming remain unqualified on Linux and Windows. Tests using fake
+providers do not establish hardware or deployment behavior.
+
+Revision-1 combined settings and old caller-owned resources require explicit
+export, review and retirement under the old owner before a fresh profile is
+enabled. Neither settings nor the new owner adopts native leases or journals.
+The offline split export has been tested with legacy and display-v2 descriptors
+and a draft owner descriptor; the latest owner descriptor and live registry
+import remain unvalidated. Applying and validating an upgrade is an operator task.
 
 ## Historical baseline: public services and ownership
 
