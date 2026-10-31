@@ -1,0 +1,13 @@
+{
+  "provider": "amaterasu.display-settings",
+  "callers": ["amaterasu.extension-registry", "amaterasu.management"],
+  "method": {
+    "service": "amaterasu.display-settings/1",
+    "method": "settings_validate",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {"required": {"values": "object"}, "optional": {}, "allow_extra": false},
+    "response": {"required": {"ok": "boolean", "valid": "boolean"}, "optional": {"message": "string"}, "allow_extra": false},
+    "privilege": "user"
+  }
+}

@@ -28,3 +28,10 @@ The receipt-store client retains at most 64 operation records and fails closed
 at capacity. Safe retirement needs a coordinator-authorized epoch and replay
 watermark; the store must not be used for production lifecycle effects until
 that contract and recovery integration are available.
+
+`examples/component-linux.json` is a component-manifest template for an
+isolated settings-validation smoke test; the packager replaces its hash and
+size. `examples/settings-validation-approval.json` illustrates a separate
+operator-installed API approval for registry and management callers. Neither
+file enables display lifecycle or action behavior, and policy approval is not
+part of the signed component manifest.
